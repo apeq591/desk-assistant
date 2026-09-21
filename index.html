@@ -62,6 +62,7 @@
       <div class="stage" id="stage" hidden>
         <video id="video" playsinline muted></video>
         <div class="gesture" id="gesture">…</div>
+        <div class="state" id="gap" style="position:absolute; right:10px; top:2px; background:rgba(0,0,0,.6); padding:2px 8px; border-radius:8px"></div>
       </div>
       <div class="bar" id="meter" hidden><i id="level"></i></div>
     </div>
@@ -102,6 +103,7 @@
       <button class="go" id="loadBtn">Load the brain</button>
       <div class="bar"><i id="loadBar"></i></div>
       <div class="state" id="brainState">not loaded (first time downloads ~0.9 GB, so use wifi)</div>
+      <div class="state">It's a small brain: it can state wrong facts confidently. Check anything that matters.</div>
       <div id="chat"></div>
       <form id="form">
         <input id="q" placeholder="Ask something…" autocomplete="off" disabled>
@@ -257,16 +259,18 @@ $('menuList').textContent = Object.values(ACTIONS).map(a => a.label).join(' · '
 
 const GESTURES = {
   Closed_Fist: '✊ fist', Open_Palm: '✋ open palm', Pointing_Up: '☝️ point up',
-  Thumb_Up: '👍 thumbs up', Thumb_Down: '👎 thumbs down', Victory: '✌️ peace', ILoveYou: '🤟 love you',
+  Thumb_Up: '👍 thumbs up', Victory: '✌️ peace', ILoveYou: '🤟 love you',
+  Pinch: '🤏 pinch', OK: '👌 OK',
 };
 // Plain words the brain works with (a 1B model matches "thumbs_up" far better than "Thumb_Up").
 const GESTURE_WORDS = {
   fist: 'Closed_Fist', open_palm: 'Open_Palm', point_up: 'Pointing_Up',
-  thumbs_up: 'Thumb_Up', thumbs_down: 'Thumb_Down', peace: 'Victory', love_you: 'ILoveYou',
+  thumbs_up: 'Thumb_Up', peace: 'Victory', love_you: 'ILoveYou', pinch: 'Pinch', ok: 'OK',
 };
 const GESTURE_HINTS = {
   fist: 'closed fist, closed hand', open_palm: 'open hand, palm, high five, wave, stop hand', point_up: 'pointing up, one finger',
-  thumbs_up: 'thumbs up, thumb up', thumbs_down: 'thumbs down, thumb down', peace: 'peace sign, V sign, two fingers, victory',
+  thumbs_up: 'thumbs up, thumb up', pinch: 'pinch, thumb and index finger touching, other fingers curled',
+  ok: 'OK sign, okay, circle with thumb and finger, other fingers up', peace: 'peace sign, V sign, two fingers, victory',
   love_you: 'I love you sign, rock sign',
 };
 
@@ -402,6 +406,32 @@ async function getRecognizer() {
   return recognizer;
 }
 
+// Pinch and OK aren't in Google's model, so Desk works them out from the 21 hand points itself.
+// Distances are divided by the hand's own size (wrist to middle knuckle), so it works near or far from the camera.
+const TOUCH = 0.35;   // thumb tip and index tip count as touching below this (tune it with the number on the video)
+const d = (a, b) => Math.hypot((a.x - b.x) * 4 / 3, a.y - b.y);   // ×4/3 because the video is 640×480
+function classify(result) {
+  const top = result.gestures[0]?.[0];
+  const lm = result.landmarks[0];
+  $('gap').textContent = '';
+  if (!lm) return null;
+  // A confident fist stays a fist: in a fist the thumb can rest near the index finger too.
+  if (top?.categoryName === 'Closed_Fist' && top.score > 0.7) return 'Closed_Fist';
+  const size = d(lm[0], lm[9]);
+  const gap = d(lm[4], lm[8]) / size;
+  $('gap').textContent = `thumb–index gap ${gap.toFixed(2)} (touching < ${TOUCH})`;
+  const extended = (tip, pip) => d(lm[0], lm[tip]) > d(lm[0], lm[pip]) * 1.1;
+  const indexOut = d(lm[0], lm[8]) > d(lm[0], lm[5]) * 1.05;   // index tip is out in front, not folded into the palm
+  if (gap < TOUCH && indexOut) {
+    const others = [extended(12, 10), extended(16, 14), extended(20, 18)].filter(Boolean).length;
+    if (others >= 2) return 'OK';
+    if (others === 0) return 'Pinch';
+  }
+  // Thumbs down is switched off (awkward to do), so it's ignored even if Google's model sees it.
+  if (top && GESTURES[top.categoryName] && top.score > 0.6) return top.categoryName;
+  return null;
+}
+
 async function startGestures() {
   try {
     await getRecognizer();
@@ -416,8 +446,7 @@ async function startGestures() {
     if (!sensors.cam.stream) return;
     if (now - lastFrameAt > 66 && video.readyState >= 2) {
       lastFrameAt = now;
-      const top = recognizer.recognizeForVideo(video, now).gestures[0]?.[0];
-      const name = top && top.categoryName !== 'None' && top.score > 0.6 ? top.categoryName : null;
+      const name = classify(recognizer.recognizeForVideo(video, now));
       if (name !== candidate) { candidate = name; candidateSince = now; }
       else if (name !== confirmed && now - candidateSince > HOLD_MS) {
         confirmed = name;
@@ -433,6 +462,7 @@ function stopGestures() {
   cancelAnimationFrame(gestureRaf);
   candidate = confirmed = null;
   $('gesture').textContent = '…';
+  $('gap').textContent = '';
 }
 
 // ================= Brain: small model running on the iPad's GPU =================
