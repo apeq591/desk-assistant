@@ -260,17 +260,16 @@ $('menuList').textContent = Object.values(ACTIONS).map(a => a.label).join(' · '
 const GESTURES = {
   Closed_Fist: '✊ fist', Open_Palm: '✋ open palm', Pointing_Up: '☝️ point up',
   Thumb_Up: '👍 thumbs up', Victory: '✌️ peace', ILoveYou: '🤟 love you',
-  Pinch: '🤏 pinch', OK: '👌 OK', Three: '3️⃣ three fingers', Four: '4️⃣ four fingers',
+  OK: '👌 OK', Three: '3️⃣ three fingers', Four: '4️⃣ four fingers',
 };
 // Plain words the brain works with (a 1B model matches "thumbs_up" far better than "Thumb_Up").
 const GESTURE_WORDS = {
   fist: 'Closed_Fist', open_palm: 'Open_Palm', point_up: 'Pointing_Up',
-  thumbs_up: 'Thumb_Up', peace: 'Victory', love_you: 'ILoveYou', pinch: 'Pinch', ok: 'OK', three: 'Three', four: 'Four',
+  thumbs_up: 'Thumb_Up', peace: 'Victory', love_you: 'ILoveYou', ok: 'OK', three: 'Three', four: 'Four',
 };
 const GESTURE_HINTS = {
   fist: 'closed fist, closed hand', open_palm: 'open hand, palm, high five, wave, stop hand', point_up: 'pointing up, one finger',
-  thumbs_up: 'thumbs up, thumb up', pinch: 'pinch, thumb and index finger touching, other fingers curled',
-  ok: 'OK sign, okay, circle with thumb and finger, other fingers up',
+  thumbs_up: 'thumbs up, thumb up', ok: 'OK sign, okay, circle with thumb and finger, other fingers up',
   three: 'three fingers, number 3', four: 'four fingers, number 4', peace: 'peace sign, V sign, two fingers, victory',
   love_you: 'I love you sign, rock sign',
 };
@@ -407,7 +406,7 @@ async function getRecognizer() {
   return recognizer;
 }
 
-// Pinch and OK aren't in Google's model, so Desk works them out from the 21 hand points itself.
+// OK, 3 and 4 aren't in Google's model, so Desk works them out from the 21 hand points itself.
 // Distances are divided by the hand's own size (wrist to middle knuckle), so it works near or far from the camera.
 const TOUCH = 0.35;   // thumb tip and index tip count as touching below this (tune it with the number on the video)
 const d = (a, b) => Math.hypot((a.x - b.x) * 4 / 3, a.y - b.y);   // ×4/3 because the video is 640×480
@@ -425,8 +424,7 @@ function classify(result) {
   const indexOut = d(lm[0], lm[8]) > d(lm[0], lm[5]) * 1.05;   // index tip is out in front, not folded into the palm
   if (gap < TOUCH && indexOut) {
     const others = [extended(12, 10), extended(16, 14), extended(20, 18)].filter(Boolean).length;
-    if (others >= 2) return 'OK';
-    if (others === 0) return 'Pinch';
+    if (others >= 2) return 'OK';   // (pinch was tried here and removed: on a real hand it read as OK or nothing)
   }
   // Counting: 3 or 4 fingers up with the thumb tucked in. (5 = open palm, 2 = peace, so those stay Google's.)
   const fingersUp = [extended(8, 6), extended(12, 10), extended(16, 14), extended(20, 18)].filter(Boolean).length;
