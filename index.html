@@ -1,0 +1,170 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Desk — step 1</title>
+<!-- No external fonts, scripts or trackers: nothing on this page talks to anyone else. -->
+<style>
+  :root { --bg:#0A0B0D; --card:#17191E; --line:#262930; --text:#F4F4F2; --dim:#8B8E96; --on:#FF6A2C; --ok:#3DDC84; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:16px/1.4 system-ui, -apple-system, sans-serif;
+         padding:max(20px, env(safe-area-inset-top)) 20px 40px; }
+  h1 { font-size:22px; margin:0 0 4px; } .sub { color:var(--dim); margin:0 0 20px; font-size:14px; }
+  .grid { display:grid; grid-template-columns:1fr 1fr; gap:14px; max-width:900px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:16px; padding:16px; }
+  .wide { grid-column:1 / -1; }
+  button.sw { width:100%; padding:18px; font:600 18px system-ui; border-radius:12px; border:2px solid var(--line);
+              background:#0F1115; color:var(--text); cursor:pointer; }
+  button.sw.on { border-color:var(--on); background:rgba(255,106,44,.15); }
+  .state { margin-top:10px; font:13px ui-monospace, monospace; color:var(--dim); }
+  .state b { color:var(--text); }
+  video { width:100%; aspect-ratio:4/3; background:#000; border-radius:10px; margin-top:12px; object-fit:cover; transform:scaleX(-1); }
+  .meter { height:14px; background:#000; border-radius:7px; margin-top:12px; overflow:hidden; }
+  .meter i { display:block; height:100%; width:0; background:var(--on); transition:width .08s; }
+  ol#log { font:12px ui-monospace, monospace; color:var(--dim); margin:0; padding-left:20px; max-height:200px; overflow:auto; }
+  .pass { color:var(--ok); } .fail { color:var(--on); }
+  @media (max-width:600px) { .grid { grid-template-columns:1fr; } }
+</style>
+</head>
+<body>
+<h1>Desk assistant: step 1, the off-switches</h1>
+<p class="sub">Both start OFF. OFF means the device is released, so the green/orange dot goes away. Leaving the page turns both off.</p>
+
+<div class="grid">
+  <div class="card">
+    <button class="sw" id="camBtn">Camera: OFF</button>
+    <div class="state" id="camState">tracks live: <b>0</b></div>
+    <video id="video" playsinline muted hidden></video>
+  </div>
+  <div class="card">
+    <button class="sw" id="micBtn">Mic: OFF</button>
+    <div class="state" id="micState">tracks live: <b>0</b></div>
+    <div class="meter" id="meter" hidden><i id="level"></i></div>
+  </div>
+
+  <div class="card wide">
+    <strong>Can this iPad run a small AI model? (step 5½ check)</strong>
+    <div class="state" id="gpu">checking…</div>
+  </div>
+
+  <div class="card wide">
+    <strong>Log</strong> <span class="state">(only on this screen for now, gone on reload)</span>
+    <ol id="log"></ol>
+  </div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+
+function log(msg) {
+  const li = document.createElement('li');
+  li.textContent = new Date().toLocaleTimeString() + '  ' + msg;
+  $('log').prepend(li);
+}
+
+// ---- The switches. One stream per device; OFF stops every track so the OS releases the hardware. ----
+const sensors = {
+  cam: { stream: null, btn: $('camBtn'), state: $('camState'), label: 'Camera', constraints: { video: { facingMode: 'user' } } },
+  mic: { stream: null, btn: $('micBtn'), state: $('micState'), label: 'Mic',    constraints: { audio: true } },
+};
+let audioCtx = null, rafId = null;
+
+function liveTracks(s) {
+  return s.stream ? s.stream.getTracks().filter(t => t.readyState === 'live').length : 0;
+}
+
+function render(key) {
+  const s = sensors[key], on = liveTracks(s) > 0;
+  s.btn.textContent = `${s.label}: ${on ? 'ON' : 'OFF'}`;
+  s.btn.classList.toggle('on', on);
+  s.state.innerHTML = `tracks live: <b>${liveTracks(s)}</b>`;
+}
+
+async function turnOn(key) {
+  const s = sensors[key];
+  try {
+    s.stream = await navigator.mediaDevices.getUserMedia(s.constraints);
+  } catch (err) {
+    log(`${s.label} could not start: ${err.name}: ${err.message}`);
+    s.stream = null;
+    render(key);
+    return;
+  }
+  // If the OS or browser kills a track on its own, reflect that instead of showing a stale ON.
+  s.stream.getTracks().forEach(t => t.addEventListener('ended', () => { log(`${s.label} track ended by the system`); turnOff(key); }));
+  if (key === 'cam') { $('video').srcObject = s.stream; $('video').hidden = false; await $('video').play(); }
+  if (key === 'mic') startMeter(s.stream);
+  log(`${s.label} ON`);
+  render(key);
+}
+
+function turnOff(key) {
+  const s = sensors[key];
+  if (!s.stream) return;
+  s.stream.getTracks().forEach(t => t.stop());
+  const stillLive = liveTracks(s);  // counted before we drop the stream, so this is a real check
+  s.stream = null;
+  if (key === 'cam') { $('video').srcObject = null; $('video').hidden = true; }
+  if (key === 'mic') stopMeter();
+  log(`${s.label} OFF, tracks still live: ${stillLive}`);
+  render(key);
+}
+
+for (const key of Object.keys(sensors)) {
+  sensors[key].btn.addEventListener('click', () => sensors[key].stream ? turnOff(key) : turnOn(key));
+}
+
+// Leaving the page, switching tabs or locking the iPad turns everything off. Coming back does NOT turn it back on.
+function allOff(reason) {
+  if (sensors.cam.stream || sensors.mic.stream) log(`everything OFF (${reason})`);
+  turnOff('cam'); turnOff('mic');
+}
+document.addEventListener('visibilitychange', () => { if (document.hidden) allOff('page hidden'); });
+window.addEventListener('pagehide', () => allOff('page closed'));
+
+// ---- Mic level meter: proves the mic is live, all processed on the iPad. ----
+function startMeter(stream) {
+  audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  const analyser = audioCtx.createAnalyser();
+  audioCtx.createMediaStreamSource(stream).connect(analyser);
+  const data = new Uint8Array(analyser.fftSize);
+  $('meter').hidden = false;
+  (function tick() {
+    analyser.getByteTimeDomainData(data);
+    let peak = 0;
+    for (const v of data) peak = Math.max(peak, Math.abs(v - 128));
+    $('level').style.width = Math.min(100, peak / 128 * 300) + '%';
+    rafId = requestAnimationFrame(tick);
+  })();
+}
+function stopMeter() {
+  cancelAnimationFrame(rafId);
+  if (audioCtx) audioCtx.close();
+  audioCtx = null;
+  $('level').style.width = '0';
+  $('meter').hidden = true;
+}
+
+// ---- WebGPU check for the on-device model later. ----
+(async () => {
+  const el = $('gpu');
+  if (!('gpu' in navigator)) {
+    el.innerHTML = '<span class="fail">No WebGPU in this browser.</span> A small on-iPad model won\'t run here as-is.';
+    return;
+  }
+  try {
+    const adapter = await navigator.gpu.requestAdapter();
+    if (!adapter) throw new Error('no adapter returned');
+    const maxBuf = Math.round(adapter.limits.maxBufferSize / 1024 / 1024);
+    el.innerHTML = `<span class="pass">WebGPU works.</span> Biggest GPU buffer: <b>${maxBuf} MB</b>. Screenshot this and send it to ApeQ.`;
+  } catch (err) {
+    el.innerHTML = `<span class="fail">WebGPU exists but failed:</span> ${err.message}`;
+  }
+})();
+
+render('cam'); render('mic');
+log('page loaded, camera OFF, mic OFF');
+</script>
+</body>
+</html>
