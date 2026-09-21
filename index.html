@@ -3,58 +3,84 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>Desk — step 1</title>
-<!-- No external fonts, scripts or trackers: nothing on this page talks to anyone else. -->
+<title>Desk</title>
+<!-- Internet is only used to download code and model files. Camera frames, mic sound, questions and answers stay on the iPad. -->
 <style>
   :root { --bg:#0A0B0D; --card:#17191E; --line:#262930; --text:#F4F4F2; --dim:#8B8E96; --on:#FF6A2C; --ok:#3DDC84; }
   * { box-sizing:border-box; }
   body { margin:0; background:var(--bg); color:var(--text); font:16px/1.4 system-ui, -apple-system, sans-serif;
-         padding:max(20px, env(safe-area-inset-top)) 20px 40px; }
-  h1 { font-size:22px; margin:0 0 4px; } .sub { color:var(--dim); margin:0 0 20px; font-size:14px; }
-  .grid { display:grid; grid-template-columns:1fr 1fr; gap:14px; max-width:900px; }
-  .card { background:var(--card); border:1px solid var(--line); border-radius:16px; padding:16px; }
-  .wide { grid-column:1 / -1; }
-  button.sw { width:100%; padding:18px; font:600 18px system-ui; border-radius:12px; border:2px solid var(--line);
-              background:#0F1115; color:var(--text); cursor:pointer; }
-  button.sw.on { border-color:var(--on); background:rgba(255,106,44,.15); }
-  .state { margin-top:10px; font:13px ui-monospace, monospace; color:var(--dim); }
-  .state b { color:var(--text); }
-  video { width:100%; aspect-ratio:4/3; background:#000; border-radius:10px; margin-top:12px; object-fit:cover; transform:scaleX(-1); }
-  .meter { height:14px; background:#000; border-radius:7px; margin-top:12px; overflow:hidden; }
-  .meter i { display:block; height:100%; width:0; background:var(--on); transition:width .08s; }
-  ol#log { font:12px ui-monospace, monospace; color:var(--dim); margin:0; padding-left:20px; max-height:200px; overflow:auto; }
+         padding:max(16px, env(safe-area-inset-top)) 16px 32px; }
+  h1 { font-size:22px; margin:0 0 2px; } .sub { color:var(--dim); margin:0 0 16px; font-size:13px; }
+  .layout { display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1.3fr); gap:14px; }
+  .col { display:flex; flex-direction:column; gap:14px; min-width:0; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:16px; padding:14px; }
+  .row { display:flex; gap:10px; }
+  button { padding:14px; font:600 16px system-ui; border-radius:12px; border:2px solid var(--line);
+           background:#0F1115; color:var(--text); cursor:pointer; }
+  button.sw { flex:1; } button.on { border-color:var(--on); background:rgba(255,106,44,.15); }
+  button.go { border-color:var(--on); background:rgba(255,106,44,.15); }
+  button:disabled { opacity:.4; cursor:default; }
+  .state { margin-top:8px; font:12px ui-monospace, monospace; color:var(--dim); white-space:pre-wrap; }
+  .stage { position:relative; margin-top:12px; }
+  video { width:100%; aspect-ratio:4/3; background:#000; border-radius:10px; object-fit:cover; transform:scaleX(-1); display:block; }
+  .gesture { position:absolute; left:10px; bottom:10px; padding:6px 12px; border-radius:999px; background:rgba(0,0,0,.65);
+             font:600 18px system-ui; }
+  .bar { height:10px; background:#000; border-radius:5px; margin-top:10px; overflow:hidden; }
+  .bar i { display:block; height:100%; width:0; background:var(--on); }
+  #chat { display:flex; flex-direction:column; gap:10px; max-height:52vh; overflow:auto; margin-top:12px; }
+  .msg { padding:10px 14px; border-radius:12px; max-width:90%; white-space:pre-wrap; }
+  .me { align-self:flex-end; background:rgba(255,106,44,.18); }
+  .ai { align-self:flex-start; background:#0F1115; border:1px solid var(--line); }
+  form { display:flex; gap:8px; margin-top:12px; }
+  input { flex:1; min-width:0; padding:14px; font:16px system-ui; border-radius:12px; border:1px solid var(--line); background:#0F1115; color:var(--text); }
+  ol#log { font:12px ui-monospace, monospace; color:var(--dim); margin:8px 0 0; padding-left:20px; max-height:180px; overflow:auto; }
   .pass { color:var(--ok); } .fail { color:var(--on); }
-  @media (max-width:600px) { .grid { grid-template-columns:1fr; } }
+  @media (max-width:760px) { .layout { grid-template-columns:1fr; } }
 </style>
 </head>
 <body>
-<h1>Desk assistant: step 1, the off-switches</h1>
-<p class="sub">Both start OFF. OFF means the device is released, so the green/orange dot goes away. Leaving the page turns both off.</p>
+<h1>Desk</h1>
+<p class="sub">Camera and mic start OFF, and leaving the page turns them off. Gestures are only recognised and logged for now; they don't trigger anything until step 4.</p>
 
-<div class="grid">
-  <div class="card">
-    <button class="sw" id="camBtn">Camera: OFF</button>
-    <div class="state" id="camState">tracks live: <b>0</b></div>
-    <video id="video" playsinline muted hidden></video>
-  </div>
-  <div class="card">
-    <button class="sw" id="micBtn">Mic: OFF</button>
-    <div class="state" id="micState">tracks live: <b>0</b></div>
-    <div class="meter" id="meter" hidden><i id="level"></i></div>
+<div class="layout">
+  <div class="col">
+    <div class="card">
+      <div class="row">
+        <button class="sw" id="camBtn">Camera: OFF</button>
+        <button class="sw" id="micBtn">Mic: OFF</button>
+      </div>
+      <div class="state" id="sensorState">camera tracks live: 0 · mic tracks live: 0</div>
+      <div class="stage" id="stage" hidden>
+        <video id="video" playsinline muted></video>
+        <div class="gesture" id="gesture">…</div>
+      </div>
+      <div class="bar" id="meter" hidden><i id="level"></i></div>
+    </div>
+
+    <div class="card">
+      <strong>Log</strong> <span class="state">(on this screen only, gone on reload)</span>
+      <ol id="log"></ol>
+    </div>
   </div>
 
-  <div class="card wide">
-    <strong>Can this iPad run a small AI model? (step 5½ check)</strong>
-    <div class="state" id="gpu">checking…</div>
-  </div>
-
-  <div class="card wide">
-    <strong>Log</strong> <span class="state">(only on this screen for now, gone on reload)</span>
-    <ol id="log"></ol>
+  <div class="col">
+    <div class="card">
+      <button class="go" id="loadBtn">Load the brain</button>
+      <div class="bar"><i id="loadBar"></i></div>
+      <div class="state" id="brainState">not loaded (first time downloads ~0.9 GB, so use wifi)</div>
+      <div id="chat"></div>
+      <form id="form">
+        <input id="q" placeholder="Ask something…" autocomplete="off" disabled>
+        <button class="go" id="send" disabled>Ask</button>
+      </form>
+    </div>
   </div>
 </div>
 
-<script>
+<script type="module">
+import { FilesetResolver, GestureRecognizer } from 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.0.1/vision_bundle.mjs';
+import * as webllm from 'https://cdn.jsdelivr.net/npm/@mlc-ai/web-llm@0.2.85/+esm';
+
 const $ = id => document.getElementById(id);
 
 function log(msg) {
@@ -63,22 +89,20 @@ function log(msg) {
   $('log').prepend(li);
 }
 
-// ---- The switches. One stream per device; OFF stops every track so the OS releases the hardware. ----
+// ================= Sensors: one stream each; OFF stops every track so the OS releases the hardware =================
 const sensors = {
-  cam: { stream: null, btn: $('camBtn'), state: $('camState'), label: 'Camera', constraints: { video: { facingMode: 'user' } } },
-  mic: { stream: null, btn: $('micBtn'), state: $('micState'), label: 'Mic',    constraints: { audio: true } },
+  cam: { stream: null, btn: $('camBtn'), label: 'Camera', constraints: { video: { facingMode: 'user', width: 640, height: 480 } } },
+  mic: { stream: null, btn: $('micBtn'), label: 'Mic',    constraints: { audio: true } },
 };
-let audioCtx = null, rafId = null;
+const liveTracks = s => s.stream ? s.stream.getTracks().filter(t => t.readyState === 'live').length : 0;
 
-function liveTracks(s) {
-  return s.stream ? s.stream.getTracks().filter(t => t.readyState === 'live').length : 0;
-}
-
-function render(key) {
-  const s = sensors[key], on = liveTracks(s) > 0;
-  s.btn.textContent = `${s.label}: ${on ? 'ON' : 'OFF'}`;
-  s.btn.classList.toggle('on', on);
-  s.state.innerHTML = `tracks live: <b>${liveTracks(s)}</b>`;
+function render() {
+  for (const s of Object.values(sensors)) {
+    const on = liveTracks(s) > 0;
+    s.btn.textContent = `${s.label}: ${on ? 'ON' : 'OFF'}`;
+    s.btn.classList.toggle('on', on);
+  }
+  $('sensorState').textContent = `camera tracks live: ${liveTracks(sensors.cam)} · mic tracks live: ${liveTracks(sensors.mic)}`;
 }
 
 async function turnOn(key) {
@@ -87,35 +111,30 @@ async function turnOn(key) {
     s.stream = await navigator.mediaDevices.getUserMedia(s.constraints);
   } catch (err) {
     log(`${s.label} could not start: ${err.name}: ${err.message}`);
-    s.stream = null;
-    render(key);
-    return;
+    s.stream = null; render(); return;
   }
-  // If the OS or browser kills a track on its own, reflect that instead of showing a stale ON.
   s.stream.getTracks().forEach(t => t.addEventListener('ended', () => { log(`${s.label} track ended by the system`); turnOff(key); }));
-  if (key === 'cam') { $('video').srcObject = s.stream; $('video').hidden = false; await $('video').play(); }
+  if (key === 'cam') { $('video').srcObject = s.stream; $('stage').hidden = false; await $('video').play(); startGestures(); }
   if (key === 'mic') startMeter(s.stream);
   log(`${s.label} ON`);
-  render(key);
+  render();
 }
 
 function turnOff(key) {
   const s = sensors[key];
   if (!s.stream) return;
   s.stream.getTracks().forEach(t => t.stop());
-  const stillLive = liveTracks(s);  // counted before we drop the stream, so this is a real check
+  const stillLive = liveTracks(s);
   s.stream = null;
-  if (key === 'cam') { $('video').srcObject = null; $('video').hidden = true; }
+  if (key === 'cam') { stopGestures(); $('video').srcObject = null; $('stage').hidden = true; }
   if (key === 'mic') stopMeter();
   log(`${s.label} OFF, tracks still live: ${stillLive}`);
-  render(key);
+  render();
 }
 
 for (const key of Object.keys(sensors)) {
   sensors[key].btn.addEventListener('click', () => sensors[key].stream ? turnOff(key) : turnOn(key));
 }
-
-// Leaving the page, switching tabs or locking the iPad turns everything off. Coming back does NOT turn it back on.
 function allOff(reason) {
   if (sensors.cam.stream || sensors.mic.stream) log(`everything OFF (${reason})`);
   turnOff('cam'); turnOff('mic');
@@ -123,7 +142,8 @@ function allOff(reason) {
 document.addEventListener('visibilitychange', () => { if (document.hidden) allOff('page hidden'); });
 window.addEventListener('pagehide', () => allOff('page closed'));
 
-// ---- Mic level meter: proves the mic is live, all processed on the iPad. ----
+// ================= Mic meter (sound level only; nothing is recorded or sent) =================
+let audioCtx = null, meterRaf = null;
 function startMeter(stream) {
   audioCtx = new (window.AudioContext || window.webkitAudioContext)();
   const analyser = audioCtx.createAnalyser();
@@ -135,36 +155,138 @@ function startMeter(stream) {
     let peak = 0;
     for (const v of data) peak = Math.max(peak, Math.abs(v - 128));
     $('level').style.width = Math.min(100, peak / 128 * 300) + '%';
-    rafId = requestAnimationFrame(tick);
+    meterRaf = requestAnimationFrame(tick);
   })();
 }
 function stopMeter() {
-  cancelAnimationFrame(rafId);
+  cancelAnimationFrame(meterRaf);
   if (audioCtx) audioCtx.close();
   audioCtx = null;
-  $('level').style.width = '0';
-  $('meter').hidden = true;
+  $('level').style.width = '0'; $('meter').hidden = true;
 }
 
-// ---- WebGPU check for the on-device model later. ----
-(async () => {
-  const el = $('gpu');
-  if (!('gpu' in navigator)) {
-    el.innerHTML = '<span class="fail">No WebGPU in this browser.</span> A small on-iPad model won\'t run here as-is.';
+// ================= Eyes: hand gestures, run on the CPU so the GPU is left for the brain =================
+const GESTURE_NAMES = { Closed_Fist: '✊ fist', Open_Palm: '✋ open palm', Pointing_Up: '☝️ point up',
+  Thumb_Up: '👍 thumbs up', Thumb_Down: '👎 thumbs down', Victory: '✌️ peace', ILoveYou: '🤟 love you' };
+const HOLD_MS = 600;          // a gesture must be held this long before it counts, so passing hand shapes aren't logged
+let recognizer = null, gestureRaf = null, lastFrameAt = 0;
+let candidate = null, candidateSince = 0, confirmed = null;
+
+async function getRecognizer() {
+  if (recognizer) return recognizer;
+  $('gesture').textContent = 'loading eyes…';
+  const vision = await FilesetResolver.forVisionTasks('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.0.1/wasm');
+  recognizer = await GestureRecognizer.createFromOptions(vision, {
+    baseOptions: { modelAssetPath: './models/gesture_recognizer.task', delegate: 'CPU' },
+    runningMode: 'VIDEO', numHands: 1,
+  });
+  return recognizer;
+}
+
+async function startGestures() {
+  try {
+    await getRecognizer();
+  } catch (err) {
+    $('gesture').textContent = 'eyes failed';
+    log(`gesture model failed to load: ${err.message}`);
     return;
   }
-  try {
-    const adapter = await navigator.gpu.requestAdapter();
-    if (!adapter) throw new Error('no adapter returned');
-    const maxBuf = Math.round(adapter.limits.maxBufferSize / 1024 / 1024);
-    el.innerHTML = `<span class="pass">WebGPU works.</span> Biggest GPU buffer: <b>${maxBuf} MB</b>. Screenshot this and send it to ApeQ.`;
-  } catch (err) {
-    el.innerHTML = `<span class="fail">WebGPU exists but failed:</span> ${err.message}`;
-  }
-})();
+  if (!sensors.cam.stream) return;   // camera was switched off while the model loaded
+  const video = $('video');
+  const loop = now => {
+    if (!sensors.cam.stream) return;
+    if (now - lastFrameAt > 66 && video.readyState >= 2) {   // ~15 checks a second is plenty
+      lastFrameAt = now;
+      const top = recognizer.recognizeForVideo(video, now).gestures[0]?.[0];
+      const name = top && top.categoryName !== 'None' && top.score > 0.6 ? top.categoryName : null;
+      if (name !== candidate) { candidate = name; candidateSince = now; }
+      else if (name !== confirmed && now - candidateSince > HOLD_MS) {
+        confirmed = name;
+        if (name) log(`gesture: ${GESTURE_NAMES[name] || name}`);
+      }
+      $('gesture').textContent = confirmed ? (GESTURE_NAMES[confirmed] || confirmed) : 'no gesture';
+    }
+    gestureRaf = requestAnimationFrame(loop);
+  };
+  gestureRaf = requestAnimationFrame(loop);
+}
+function stopGestures() {
+  cancelAnimationFrame(gestureRaf);
+  candidate = confirmed = null;
+  $('gesture').textContent = '…';
+}
 
-render('cam'); render('mic');
-log('page loaded, camera OFF, mic OFF');
+// ================= Brain: small model running on the iPad's GPU =================
+const MODEL_F16 = 'Llama-3.2-1B-Instruct-q4f16_1-MLC';
+const MODEL_F32 = 'Llama-3.2-1B-Instruct-q4f32_1-MLC';
+const MAX_TURNS = 6;   // only the last few exchanges are sent back in, so a long chat doesn't run the iPad out of memory
+let engine = null;
+const turns = [];
+
+function systemPrompt() {
+  const now = new Date().toLocaleString('en-GB', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric', hour: '2-digit', minute: '2-digit' });
+  return `You are Desk, a helpful assistant for a 13-year-old inventor in the UK. It is now ${now}.
+Answer general-knowledge questions directly and confidently, in a few sentences.
+Your knowledge stops at the end of 2023 and you have no internet. For news, current leaders, sports results or anything that could have changed since 2023, say plainly that you can't know it.`;
+}
+
+function bubble(cls, text) {
+  const d = document.createElement('div');
+  d.className = 'msg ' + cls; d.textContent = text;
+  $('chat').append(d); $('chat').scrollTop = $('chat').scrollHeight;
+  return d;
+}
+
+$('loadBtn').addEventListener('click', async () => {
+  $('loadBtn').disabled = true;
+  const adapter = 'gpu' in navigator ? await navigator.gpu.requestAdapter() : null;
+  if (!adapter) { $('brainState').innerHTML = '<span class="fail">No WebGPU here, so the brain cannot run.</span>'; return; }
+  const model = adapter.features.has('shader-f16') ? MODEL_F16 : MODEL_F32;
+  const t0 = performance.now();
+  try {
+    engine = await webllm.CreateMLCEngine(model, {
+      initProgressCallback: p => { $('loadBar').style.width = Math.round(p.progress * 100) + '%'; $('brainState').textContent = p.text; },
+    });
+  } catch (err) {
+    $('brainState').innerHTML = `<span class="fail">Failed to load: ${err.message}</span>`;
+    log(`brain failed to load: ${err.message}`);
+    $('loadBtn').disabled = false; return;
+  }
+  const secs = Math.round((performance.now() - t0) / 1000);
+  $('brainState').innerHTML = `<span class="pass">Brain ready</span> (${model}, ${secs} s)`;
+  $('loadBtn').hidden = true;
+  log(`brain loaded in ${secs} s`);
+  $('q').disabled = false; $('send').disabled = false;
+});
+
+$('form').addEventListener('submit', async e => {
+  e.preventDefault();
+  const q = $('q').value.trim();
+  if (!q || !engine) return;
+  $('q').value = ''; $('q').disabled = true; $('send').disabled = true;
+  bubble('me', q);
+  log(`asked: ${q.slice(0, 60)}`);
+  turns.push({ role: 'user', content: q });
+  const out = bubble('ai', '…');
+  let text = '';
+  try {
+    const messages = [{ role: 'system', content: systemPrompt() }, ...turns.slice(-MAX_TURNS * 2)];
+    const stream = await engine.chat.completions.create({ messages, stream: true, temperature: 0.4 });
+    for await (const chunk of stream) {
+      text += chunk.choices[0]?.delta?.content || '';
+      out.textContent = text; $('chat').scrollTop = $('chat').scrollHeight;
+    }
+    turns.push({ role: 'assistant', content: text });
+  } catch (err) {
+    turns.pop();
+    out.textContent = `Error: ${err.message}`; out.classList.add('fail');
+    log(`brain error: ${err.message}`);
+  }
+  $('q').disabled = false; $('send').disabled = false;
+});
+
+render();
+log('page loaded, camera OFF, mic OFF, brain not loaded');
 </script>
 </body>
 </html>
