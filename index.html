@@ -101,7 +101,7 @@
     </div>
 
     <div class="card">
-      <button class="go" id="loadBtn">Load the brain</button>
+      <button class="go" id="loadBtn">Load the brain + ears</button>
       <div class="bar"><i id="loadBar"></i></div>
       <div class="state" id="brainState">not loaded (first time downloads ~0.9 GB, so use wifi)</div>
       <div class="state">It's a small brain: it can state wrong facts confidently. Check anything that matters.</div>
@@ -253,9 +253,12 @@ async function loadEars() {
   if (transcriber) { ears('👂 listening'); return; }
   if (!earsLoading) {
     ears('loading ears… (first time downloads ~40 MB)');
-    // Loaded only when the mic is first switched on, so if this fails the rest of Desk still works.
+    // Loaded separately, so if this fails the rest of Desk still works.
     earsLoading = import('https://cdn.jsdelivr.net/npm/@huggingface/transformers@4.3.0/+esm')
-      .then(({ pipeline }) => pipeline('automatic-speech-recognition', 'onnx-community/whisper-tiny.en', { device: 'wasm', dtype: 'q8' }))
+      .then(({ pipeline, env }) => {
+        env.backends.onnx.wasm.numThreads = 1;   // one thread: less memory, and GitHub Pages can't do multi-thread anyway
+        return pipeline('automatic-speech-recognition', 'onnx-community/whisper-tiny.en', { device: 'wasm', dtype: 'q8' });
+      })
       .then(t => { transcriber = t; log('ears loaded'); })
       .catch(err => { earsLoading = null; log(`ears failed to load: ${err.message}`); ears(`ears failed: ${err.message}`); throw err; });
   }
@@ -577,7 +580,7 @@ function setInputs() {
 function systemPrompt() {
   const now = new Date().toLocaleString('en-GB', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric', hour: '2-digit', minute: '2-digit' });
   return `You are Desk, a helpful assistant for a 13-year-old inventor in the UK. It is now ${now}.
-Answer general-knowledge questions directly and confidently, in a few sentences.
+Answer general-knowledge questions (science, maths, geography, capitals, history, how things work) directly and confidently, in a few sentences. You DO know these.
 Your knowledge stops at the end of 2023 and you have no internet. For news, current leaders, sports results or anything that could have changed since 2023, say plainly that you can't know it.`;
 }
 
@@ -621,6 +624,9 @@ async function askBrain(q, speak = false, showQuestion = true) {
 
 $('loadBtn').addEventListener('click', async () => {
   $('loadBtn').disabled = true;
+  // Ears go first: on the iPad they failed with "Out of memory" when loaded after the brain had taken its ~0.9 GB.
+  $('brainState').textContent = 'loading ears first…';
+  await loadEars();
   const adapter = 'gpu' in navigator ? await navigator.gpu.requestAdapter() : null;
   if (!adapter) { $('brainState').innerHTML = '<span class="fail">No WebGPU here, so the brain cannot run.</span>'; return; }
   const model = adapter.features.has('shader-f16') ? MODEL_F16 : MODEL_F32;
