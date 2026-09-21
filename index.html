@@ -65,6 +65,7 @@
         <div class="state" id="gap" style="position:absolute; right:10px; top:2px; background:rgba(0,0,0,.6); padding:2px 8px; border-radius:8px"></div>
       </div>
       <div class="bar" id="meter" hidden><i id="level"></i></div>
+      <div class="state" id="ears"></div>
     </div>
 
     <div class="card">
@@ -187,12 +188,22 @@ function allOff(reason) {
 document.addEventListener('visibilitychange', () => { if (document.hidden) allOff('page hidden'); });
 window.addEventListener('pagehide', () => allOff('page closed'));
 
-// ================= Mic meter (sound level only; nothing is recorded or sent) =================
-let audioCtx = null, meterRaf = null;
+// ================= Mic: level meter + ears (speech → text with Whisper, on the iPad's CPU) =================
+// Audio is only kept in memory for the one sentence being heard, then thrown away. Nothing is recorded to storage or sent.
+let audioCtx = null, meterRaf = null, processor = null;
+const VOICE_LEVEL = 0.02;     // how loud counts as talking (RMS)
+const END_SILENCE_MS = 900;   // this much quiet after talking = end of sentence
+const MAX_SPEECH_MS = 15000;
+const PRE_ROLL = 6;           // keep ~0.5 s from just before you started, so the first word isn't cut off
+let chunks = [], preRoll = [], talking = false, lastLoudAt = 0, talkStart = 0;
+
+function ears(text) { $('ears').textContent = text; }
+
 function startMeter(stream) {
   audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  const src = audioCtx.createMediaStreamSource(stream);
   const analyser = audioCtx.createAnalyser();
-  audioCtx.createMediaStreamSource(stream).connect(analyser);
+  src.connect(analyser);
   const data = new Uint8Array(analyser.fftSize);
   $('meter').hidden = false;
   (function tick() {
@@ -202,12 +213,91 @@ function startMeter(stream) {
     $('level').style.width = Math.min(100, peak / 128 * 300) + '%';
     meterRaf = requestAnimationFrame(tick);
   })();
+
+  processor = audioCtx.createScriptProcessor(4096, 1, 1);
+  src.connect(processor);
+  processor.connect(audioCtx.destination);   // Safari only runs the processor if it's connected; it outputs silence
+  processor.onaudioprocess = e => {
+    const input = e.inputBuffer.getChannelData(0);
+    e.outputBuffer.getChannelData(0).fill(0);
+    // Don't listen while Desk is talking or thinking, so it never answers its own voice.
+    if (!transcriber || busy || hearing || speechSynthesis.speaking) { chunks = []; talking = false; return; }
+    let sum = 0;
+    for (const v of input) sum += v * v;
+    const loud = Math.sqrt(sum / input.length) > VOICE_LEVEL;
+    const now = performance.now();
+    const copy = new Float32Array(input);
+    if (loud) { lastLoudAt = now; if (!talking) { talking = true; talkStart = now; chunks = preRoll; ears('👂 hearing you…'); } }
+    if (talking) chunks.push(copy);
+    else { preRoll.push(copy); if (preRoll.length > PRE_ROLL) preRoll.shift(); }
+    if (talking && (now - lastLoudAt > END_SILENCE_MS || now - talkStart > MAX_SPEECH_MS)) {
+      const clip = chunks; chunks = []; preRoll = []; talking = false;
+      if (now - talkStart > 500) handleSpeech(clip, audioCtx.sampleRate);
+      else ears('👂 listening');
+    }
+  };
+  loadEars();
 }
+
 function stopMeter() {
   cancelAnimationFrame(meterRaf);
+  if (processor) { processor.onaudioprocess = null; processor.disconnect(); processor = null; }
   if (audioCtx) audioCtx.close();
-  audioCtx = null;
+  audioCtx = null; chunks = []; talking = false;
   $('level').style.width = '0'; $('meter').hidden = true;
+  ears('');
+}
+
+let transcriber = null, earsLoading = null, hearing = false;
+async function loadEars() {
+  if (transcriber) { ears('👂 listening'); return; }
+  if (!earsLoading) {
+    ears('loading ears… (first time downloads ~40 MB)');
+    // Loaded only when the mic is first switched on, so if this fails the rest of Desk still works.
+    earsLoading = import('https://cdn.jsdelivr.net/npm/@huggingface/transformers@4.3.0/+esm')
+      .then(({ pipeline }) => pipeline('automatic-speech-recognition', 'onnx-community/whisper-tiny.en', { device: 'wasm', dtype: 'q8' }))
+      .then(t => { transcriber = t; log('ears loaded'); })
+      .catch(err => { earsLoading = null; log(`ears failed to load: ${err.message}`); ears(`ears failed: ${err.message}`); throw err; });
+  }
+  try { await earsLoading; } catch { return; }
+  if (sensors.mic.stream) ears(engine ? '👂 listening' : '👂 listening (load the brain so I can answer)');
+}
+
+async function to16k(clip, rate) {
+  const len = clip.reduce((n, c) => n + c.length, 0);
+  const joined = new Float32Array(len);
+  let off = 0;
+  for (const c of clip) { joined.set(c, off); off += c.length; }
+  if (rate === 16000) return joined;
+  const offline = new OfflineAudioContext(1, Math.ceil(len * 16000 / rate), 16000);
+  const buf = offline.createBuffer(1, len, rate);
+  buf.copyToChannel(joined, 0);
+  const node = offline.createBufferSource();
+  node.buffer = buf; node.connect(offline.destination); node.start();
+  return (await offline.startRendering()).getChannelData(0);
+}
+
+async function handleSpeech(clip, rate) {
+  hearing = true;
+  ears('🧠 thinking…');
+  let text = '';
+  try {
+    const audio = await to16k(clip, rate);
+    text = ((await transcriber(audio)).text || '').trim();
+  } catch (err) {
+    log(`ears error: ${err.message}`);
+  }
+  hearing = false;
+  // Whisper writes things like "[BLANK_AUDIO]" or "(music)" for noise, so those don't count as a question.
+  if (!text || /^[\[(].*[\])]$/.test(text) || text.replace(/[^a-z]/gi, '').length < 2) {
+    if (sensors.mic.stream) ears('👂 listening');
+    return;
+  }
+  if (!engine) { log('heard something, but the brain is not loaded'); ears('👂 listening (load the brain so I can answer)'); return; }
+  log(`voice question: ${text.slice(0, 60)}`);
+  // Your words are not shown in the chat, only the answer. They stay in the log.
+  await askBrain(text, true, false);
+  if (sensors.mic.stream) ears('👂 listening');
 }
 
 // ================= Timer =================
@@ -238,6 +328,7 @@ function stopTimer() {
 // Uses the iPad's built-in voices.
 function say(text) {
   if (!('speechSynthesis' in window)) return;
+  if (sensors.mic.stream) ears('🔊 talking…');
   speechSynthesis.cancel();
   speechSynthesis.speak(new SpeechSynthesisUtterance(text));
 }
@@ -474,7 +565,8 @@ function stopGestures() {
 const MODEL_F16 = 'Llama-3.2-1B-Instruct-q4f16_1-MLC';
 const MODEL_F32 = 'Llama-3.2-1B-Instruct-q4f32_1-MLC';
 const MAX_TURNS = 6;
-let engine = null, busy = false;
+let engine = null;
+let busy = false;
 const turns = [];
 
 function setInputs() {
@@ -501,11 +593,11 @@ function readLastAnswer() {
   if (lastAnswer) say(lastAnswer); else log('nothing to read aloud yet');
 }
 
-async function askBrain(q, speak = false) {
+async function askBrain(q, speak = false, showQuestion = true) {
   if (!engine) { log('brain not loaded, so that action was skipped'); return; }
   if (busy) { log('brain busy, so that action was skipped'); return; }
   busy = true; setInputs();
-  bubble('me', q);
+  if (showQuestion) bubble('me', q);
   turns.push({ role: 'user', content: q });
   const out = bubble('ai', '…');
   let text = '';
