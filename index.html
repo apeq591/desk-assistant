@@ -260,17 +260,18 @@ $('menuList').textContent = Object.values(ACTIONS).map(a => a.label).join(' · '
 const GESTURES = {
   Closed_Fist: '✊ fist', Open_Palm: '✋ open palm', Pointing_Up: '☝️ point up',
   Thumb_Up: '👍 thumbs up', Victory: '✌️ peace', ILoveYou: '🤟 love you',
-  Pinch: '🤏 pinch', OK: '👌 OK',
+  Pinch: '🤏 pinch', OK: '👌 OK', Three: '3️⃣ three fingers', Four: '4️⃣ four fingers',
 };
 // Plain words the brain works with (a 1B model matches "thumbs_up" far better than "Thumb_Up").
 const GESTURE_WORDS = {
   fist: 'Closed_Fist', open_palm: 'Open_Palm', point_up: 'Pointing_Up',
-  thumbs_up: 'Thumb_Up', peace: 'Victory', love_you: 'ILoveYou', pinch: 'Pinch', ok: 'OK',
+  thumbs_up: 'Thumb_Up', peace: 'Victory', love_you: 'ILoveYou', pinch: 'Pinch', ok: 'OK', three: 'Three', four: 'Four',
 };
 const GESTURE_HINTS = {
   fist: 'closed fist, closed hand', open_palm: 'open hand, palm, high five, wave, stop hand', point_up: 'pointing up, one finger',
   thumbs_up: 'thumbs up, thumb up', pinch: 'pinch, thumb and index finger touching, other fingers curled',
-  ok: 'OK sign, okay, circle with thumb and finger, other fingers up', peace: 'peace sign, V sign, two fingers, victory',
+  ok: 'OK sign, okay, circle with thumb and finger, other fingers up',
+  three: 'three fingers, number 3', four: 'four fingers, number 4', peace: 'peace sign, V sign, two fingers, victory',
   love_you: 'I love you sign, rock sign',
 };
 
@@ -427,6 +428,12 @@ function classify(result) {
     if (others >= 2) return 'OK';
     if (others === 0) return 'Pinch';
   }
+  // Counting: 3 or 4 fingers up with the thumb tucked in. (5 = open palm, 2 = peace, so those stay Google's.)
+  const fingersUp = [extended(8, 6), extended(12, 10), extended(16, 14), extended(20, 18)].filter(Boolean).length;
+  const thumbTucked = d(lm[4], lm[9]) / size < 0.55;   // thumb tip near the middle knuckle
+  $('gap').textContent += ` · fingers up ${fingersUp}${thumbTucked ? ', thumb in' : ''}`;
+  if (thumbTucked && fingersUp === 4) return 'Four';
+  if (thumbTucked && fingersUp === 3) return 'Three';
   // Thumbs down is switched off (awkward to do), so it's ignored even if Google's model sees it.
   if (top && GESTURES[top.categoryName] && top.score > 0.6) return top.categoryName;
   return null;
