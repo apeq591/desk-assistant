@@ -310,9 +310,9 @@ async function handleSpeech(clip, rate) {
     if (sensors.mic.stream) ears('👂 listening');
     return;
   }
-  if (!engine) { log('heard something, but the brain is not loaded'); ears('👂 listening (load the brain so I can answer)'); return; }
   const no = blockedReason('voice question');
-  if (no) { sayOnce(no); if (sensors.mic.stream) ears('👂 listening'); return; }
+  if (no) { refuse(no); if (sensors.mic.stream) ears('👂 listening'); return; }
+  if (!engine) { log('heard something, but the brain is not loaded'); ears('👂 listening (load the brain so I can answer)'); return; }
   log(`voice question: ${text.slice(0, 60)}`);
   // Your words are not shown in the chat, only the answer. They stay in the log.
   await askBrain(text, true, false);
@@ -340,15 +340,16 @@ function drawFaceState() {
 // With a learned face, Desk only obeys when it can see Mukta right now. Returns why not, or null if it's fine.
 function blockedReason(what) {
   if (!faceprint || who === 'mukta') return null;
-  const why = !sensors.cam.stream ? 'turn the camera on so I can see it is you' : 'I only take that from Mukta';
+  const why = !sensors.cam.stream ? "I only answer to Mukta. Turn the camera on so I can see it's you" : 'I only answer to Mukta';
   log(`blocked ${what}: ${why}`);
   return why;
 }
 const saidAt = {};
-function sayOnce(text) {   // don't repeat the same refusal more than every 20 s
-  if (Date.now() - (saidAt[text] || 0) < 20000) return;
+function refuse(text) {   // says it and shows it; the spoken part isn't repeated more than every 5 s
+  bubble('ai', `Sorry, but ${text}.`);
+  if (Date.now() - (saidAt[text] || 0) < 5000) return;
   saidAt[text] = Date.now();
-  say(`Sorry, ${text}.`);
+  say(`Sorry, but ${text}.`);
 }
 
 async function getHuman() {
@@ -594,7 +595,7 @@ function showProposal(p) {
   const no = document.createElement('button'); no.textContent = 'Reject';
   yes.addEventListener('click', () => {
     const no = blockedReason('approve');
-    if (no) { box.querySelector('.state').textContent = `Can't approve: ${no}.`; return; }
+    if (no) { box.querySelector('.state').textContent = `Sorry, but ${no}.`; return; }
     rules[p.gesture] = p.action; saveRules();
     log(`APPROVED: ${GESTURES[p.gesture]} → ${ACTIONS[p.action].label}`);
     box.remove();
@@ -635,7 +636,7 @@ $('teachForm').addEventListener('submit', async e => {
   const request = $('teach').value.trim();
   if (!request || !engine || busy) return;
   const no = blockedReason('teach');
-  if (no) { $('proposal').innerHTML = `<div class="state fail">Not now: ${no}.</div>`; return; }
+  if (no) { $('proposal').innerHTML = `<div class="state fail">Sorry, but ${no}.</div>`; return; }
   busy = true; setInputs();
   $('proposal').innerHTML = '<div class="state">thinking…</div>';
   log(`teach request: ${request.slice(0, 80)}`);
@@ -838,7 +839,7 @@ $('form').addEventListener('submit', e => {
   const q = $('q').value.trim();
   if (!q) return;
   const no = blockedReason('typed question');
-  if (no) { bubble('ai', `Sorry, ${no}.`); return; }
+  if (no) { refuse(no); return; }
   $('q').value = '';
   log(`asked: ${q.slice(0, 60)}`);
   askBrain(q);
@@ -851,7 +852,7 @@ $('addRule').addEventListener('click', () => {
   const g = $('pickG').value, a = $('pickA').value;
   if (!GESTURES[g] || !ACTIONS[a]) return;
   const no = blockedReason('add rule');
-  if (no) { $('proposal').innerHTML = `<div class="state fail">Not now: ${no}.</div>`; return; }
+  if (no) { $('proposal').innerHTML = `<div class="state fail">Sorry, but ${no}.</div>`; return; }
   rules[g] = a; saveRules();
   log(`rule added by you: ${GESTURES[g]} → ${ACTIONS[a].label}`);
 });
