@@ -62,6 +62,7 @@
       <div class="stage" id="stage" hidden>
         <video id="video" playsinline muted></video>
         <div class="gesture" id="gesture">…</div>
+        <div class="gesture" id="motion" style="bottom:auto; top:10px" hidden></div>
         <div class="state" id="gap" style="position:absolute; right:10px; top:2px; background:rgba(0,0,0,.6); padding:2px 8px; border-radius:8px"></div>
       </div>
       <div class="bar" id="meter" hidden><i id="level"></i></div>
@@ -385,14 +386,14 @@ async function startFace() {
   const tick = async () => {
     if (run !== faceRun || !sensors.cam.stream) return;
     try { await faceStep(); } catch (err) { log(`face error: ${err.message}`); }
-    faceTimer = setTimeout(tick, 250);   // 4 checks a second is plenty
+    faceTimer = setTimeout(tick, 100);   // 10 a second: a nod only lasts about a second
   };
   tick();
 }
 function stopFace() {
   faceRun++;
   clearTimeout(faceTimer);
-  who = 'nobody'; whoVotes = []; awaySince = 0; enrolling = null;
+  who = 'nobody'; whoVotes = []; awaySince = 0; enrolling = null; presentSince = 0; headHist = [];
   $('who').textContent = 'camera off';
 }
 
@@ -404,6 +405,7 @@ async function faceStep() {
   // Looking at the iPad? No face, or head turned more than ~30°, counts as away.
   const a = f?.rotation?.angle;
   const looking = !!a && Math.abs(a.yaw) < 0.5 && Math.abs(a.pitch) < 0.45;
+  readHead(a, now);
   if (looking) awaySince = 0;
   else if (!awaySince) awaySince = now;
   if (awaySince && now - awaySince > LOOK_AWAY_MS && speechSynthesis.speaking) {
@@ -432,7 +434,8 @@ async function faceStep() {
 function setWho(next) {
   const prev = who;
   who = next;
-  if (next === 'nobody') { log('nobody in view'); return; }
+  if (next === 'nobody') { presentSince = 0; log('nobody in view'); return; }
+  if (prev === 'nobody') presentSince = Date.now();
   log(`sees: ${next === 'mukta' ? 'Mukta' : faceprint ? 'someone else' : 'a face'}`);
   if (prev === 'nobody' && Date.now() - (lastGreet[next] || 0) > GREET_GAP_MS) {
     lastGreet[next] = Date.now();
@@ -472,22 +475,123 @@ $('forgetFace').addEventListener('click', () => {
   drawFaceState();
 });
 
+// ================= Motion: nod, shake and wave are movements, so they're read from the last ~1.5 s =================
+// Counts back-and-forth swings in a list of numbers, ignoring jitter smaller than `dead`.
+function swings(vals, dead) {
+  let dir = 0, turns = 0, ref = vals[0];
+  for (const v of vals) {
+    const d = v - ref;
+    if (Math.abs(d) < dead) continue;
+    const nd = Math.sign(d);
+    if (dir && nd !== dir) turns++;
+    dir = nd; ref = v;
+  }
+  return { turns, range: Math.max(...vals) - Math.min(...vals) };
+}
+
+function showMotion(text) {
+  $('motion').textContent = text; $('motion').hidden = false;
+  clearTimeout(showMotion.t);
+  showMotion.t = setTimeout(() => { $('motion').hidden = true; }, 1500);
+}
+
+// Head: nod = up/down swings, shake = side-to-side swings (angles in radians from the face tracker).
+const MOVE_WINDOW_MS = 1500, HEAD_COOLDOWN_MS = 2000;
+let headHist = [], lastHeadMove = 0, presentSince = 0;
+function readHead(a, now) {
+  if (!a) { headHist = []; return; }
+  headHist.push({ t: now, yaw: a.yaw, pitch: a.pitch });
+  headHist = headHist.filter(h => now - h.t < MOVE_WINDOW_MS);
+  if (headHist.length < 6 || now - lastHeadMove < HEAD_COOLDOWN_MS) return;
+  const p = swings(headHist.map(h => h.pitch), 0.04);
+  const y = swings(headHist.map(h => h.yaw), 0.04);
+  let move = null;
+  if (p.turns >= 2 && p.range > 0.12 && p.range > y.range * 1.5) move = 'nod';
+  else if (y.turns >= 2 && y.range > 0.15 && y.range > p.range * 1.5) move = 'shake';
+  if (!move) return;
+  lastHeadMove = now; headHist = [];
+  onHead(move);
+}
+
+// A yes/no question Desk asked out loud. A nod or shake answers it (so do the buttons it shows).
+let pending = null;
+function askYesNo(question, yes, no, secs = 20) {
+  say(question);
+  const d = bubble('ai', question + '  (nod or shake)');
+  pending = { yes, no, until: Date.now() + secs * 1000, bubble: d };
+}
+
+function onHead(move) {
+  log(`head: ${move === 'nod' ? 'nod = yes' : 'shake = no'}`);
+  showMotion(move === 'nod' ? '✅ nod = yes' : '❌ shake = no');
+  if (blockedReason(move)) return;
+  // 1. A question Desk just asked.
+  if (pending && Date.now() < pending.until) {
+    const p = pending; pending = null;
+    p.bubble.textContent += move === 'nod' ? '  → yes' : '  → no';
+    (move === 'nod' ? p.yes : p.no)();
+    return;
+  }
+  // 2. A suggestion card. A shake can reject it (taking power away is safe).
+  //    A nod can NOT approve it: a misread nod must never change what Desk does, so approving stays a tap.
+  const card = $('proposal').querySelector('.proposal');
+  if (card) {
+    if (move === 'shake') { [...card.querySelectorAll('button')].find(b => b.textContent === 'Reject')?.click(); say('Rejected.'); }
+    else say('Tap Approve to confirm.');
+    return;
+  }
+  // 3. The brain's last answer was a question: answer it.
+  const lastAi = [...document.querySelectorAll('#chat .ai')].pop()?.textContent || '';
+  if (engine && !busy && /\?\s*$/.test(lastAi)) askBrain(move === 'nod' ? 'Yes.' : 'No.', true, false);
+}
+
+// Wave: the hand swinging side to side. Uses the middle knuckle, which moves more steadily than the fingertips.
+const WAVE_COOLDOWN_MS = 3000, HI_WINDOW_MS = 60000;
+let handHist = [], lastWave = 0;
+function readHand(result, now) {
+  const lm = result.landmarks[0];
+  if (!lm) { handHist = []; return; }
+  handHist.push({ t: now, x: lm[9].x, y: lm[9].y });
+  handHist = handHist.filter(h => now - h.t < MOVE_WINDOW_MS);
+  if (handHist.length < 8 || now - lastWave < WAVE_COOLDOWN_MS) return;
+  const x = swings(handHist.map(h => h.x), 0.03);
+  const y = swings(handHist.map(h => h.y), 0.03);
+  if (x.turns >= 2 && x.range > 0.08 && x.range > y.range * 1.5) { lastWave = now; handHist = []; onWave(); }
+}
+// Gesture rules only fire from a still hand, so waving an open palm doesn't set off the open-palm rule.
+function handStill(now) {
+  const recent = handHist.filter(h => now - h.t < 600).map(h => h.x);
+  return recent.length < 3 || Math.max(...recent) - Math.min(...recent) < 0.05;
+}
+
+function onWave() {
+  log('gesture: 👋 wave');
+  showMotion('👋 wave');
+  const name = who === 'mukta' ? ' Mukta' : '';
+  // Hi if you've only just arrived (or there's no face tracker to tell), bye if you've been here a while.
+  const hereFor = presentSince ? Date.now() - presentSince : 0;
+  if (hereFor < HI_WINDOW_MS) { say(`Hi${name}!`); log('said hi'); }
+  else { say(`Bye${name}! See you soon.`); log('said bye'); }
+}
+
 // ================= Timer =================
-let timerEnd = 0, timerId = null;
+let timerEnd = 0, timerId = null, timerMins = 0;
 function drawTimer() {
   const left = Math.max(0, Math.round((timerEnd - Date.now()) / 1000));
   $('timer').textContent = `${String(Math.floor(left / 60)).padStart(2, '0')}:${String(left % 60).padStart(2, '0')}`;
   if (left === 0) {
     clearInterval(timerId); timerId = null;
     $('timer').classList.add('done');
-    say('Timer done');
     log('timer finished');
+    if (timerMins !== 5) askYesNo('Timer done! Want a 5-minute break?', () => { startTimer(5); say('Break started.'); }, () => say('Okay, no break.'));
+    else say('Timer done.');
   }
 }
 function startTimer(mins) {
   clearInterval(timerId);
   $('timer').classList.remove('done');
   timerEnd = Date.now() + mins * 60000;
+  timerMins = mins;
   timerId = setInterval(drawTimer, 250);
   drawTimer();
 }
@@ -563,10 +667,11 @@ function drawRules() {
 
 const COOLDOWN_MS = 3000;
 const lastFired = {};
-function onGesture(g) {
+function onGesture(g, still = true) {
   log(`gesture: ${GESTURES[g]}`);
   const a = rules[g];
   if (!a || !ACTIONS[a]) return;
+  if (!still) { log(`rule skipped: hand was moving`); return; }
   if (Date.now() - (lastFired[g] || 0) < COOLDOWN_MS) return;
   if (blockedReason(`rule ${GESTURES[g]}`)) { lastFired[g] = Date.now(); return; }
   lastFired[g] = Date.now();
@@ -719,11 +824,13 @@ async function startGestures() {
     if (!sensors.cam.stream) return;
     if (now - lastFrameAt > 66 && video.readyState >= 2) {
       lastFrameAt = now;
-      const name = classify(recognizer.recognizeForVideo(video, now));
+      const result = recognizer.recognizeForVideo(video, now);
+      const name = classify(result);
+      readHand(result, now);
       if (name !== candidate) { candidate = name; candidateSince = now; }
       else if (name !== confirmed && now - candidateSince > HOLD_MS) {
         confirmed = name;
-        if (name) onGesture(name);
+        if (name) onGesture(name, handStill(now));
       }
       $('gesture').textContent = confirmed ? GESTURES[confirmed] : 'no gesture';
     }
