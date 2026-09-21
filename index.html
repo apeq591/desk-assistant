@@ -80,6 +80,11 @@
       <div class="state">saved on this iPad only</div>
       <ol id="log"></ol>
     </div>
+
+    <div class="card">
+      <div class="row" style="justify-content:space-between"><h2>Space on this iPad</h2><button class="small" id="spaceBtn">Check</button></div>
+      <div class="state" id="space">tap Check</div>
+    </div>
   </div>
 
   <div class="col">
@@ -681,6 +686,32 @@ $('addRule').addEventListener('click', () => {
 
 $('brainPick').innerHTML = Object.entries(BRAINS).map(([k, b]) => `<option value="${k}">${b.name}</option>`).join('');
 $('brainPick').value = Object.keys(BRAINS).find(k => BRAINS[k] === brain);
+
+// Storage = the saved downloads (brains, ears, eyes). Safari doesn't let a page see how much live memory (RAM) is left.
+async function checkSpace() {
+  const mb = b => Math.round(b / 1048576);
+  const lines = [];
+  if (navigator.storage?.estimate) {
+    const { usage, quota } = await navigator.storage.estimate();
+    lines.push(`Saved downloads: ${mb(usage)} MB used of ${mb(quota)} MB Safari allows this site`);
+  }
+  if ('caches' in window) {
+    for (const name of await caches.keys()) {
+      let total = 0;
+      const cache = await caches.open(name);
+      for (const req of await cache.keys()) {
+        const res = await cache.match(req);
+        total += Number(res?.headers.get('content-length')) || 0;
+      }
+      if (total) lines.push(`  ${name}: ${mb(total)} MB`);
+    }
+  }
+  const adapter = 'gpu' in navigator ? await navigator.gpu.requestAdapter() : null;
+  if (adapter) lines.push(`Biggest single GPU block allowed: ${mb(adapter.limits.maxBufferSize)} MB`);
+  lines.push('Live memory (RAM): Safari keeps this hidden from web pages. It depends on your iPad model.');
+  $('space').textContent = lines.join('\n');
+}
+$('spaceBtn').addEventListener('click', checkSpace);
 
 drawLog();
 drawRules();
