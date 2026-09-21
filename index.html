@@ -139,7 +139,7 @@
 </div>
 
 <script type="module">
-import { FilesetResolver, GestureRecognizer } from 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.0.1/vision_bundle.mjs';
+import { FilesetResolver, GestureRecognizer, FaceLandmarker } from 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.0.1/vision_bundle.mjs';
 import * as webllm from 'https://cdn.jsdelivr.net/npm/@mlc-ai/web-llm@0.2.85/+esm';
 
 const $ = id => document.getElementById(id);
@@ -373,7 +373,7 @@ async function getHuman() {
         filter: { enabled: false }, gesture: { enabled: false }, body: { enabled: false }, hand: { enabled: false },
         object: { enabled: false }, segmentation: { enabled: false },
         face: { enabled: true, detector: { rotation: true, maxDetected: 1 }, mesh: { enabled: true }, iris: { enabled: false },
-                description: { enabled: true }, emotion: { enabled: true }, antispoof: { enabled: false }, liveness: { enabled: false } },
+                description: { enabled: true }, emotion: { enabled: false }, antispoof: { enabled: false }, liveness: { enabled: false } },
       });
       await h.load();
       await h.warmup();
@@ -411,7 +411,7 @@ async function faceStep() {
   // The face fingerprint is the slow part, so it only runs every 4th frame; head movement is read on every frame.
   faceFrame++;
   const withPrint = faceFrame % 4 === 0 || !!enrolling;
-  const res = await human.detect($('video'), { face: { description: { enabled: withPrint }, emotion: { enabled: withPrint } } });
+  const res = await human.detect($('video'), { face: { description: { enabled: withPrint } } });
   const f = res.face[0];
   const now = performance.now();
   lastFaceBox = f?.box || null;
@@ -431,7 +431,6 @@ async function faceStep() {
   // Who is it? Needs 3 checks in a row to agree before it changes its mind.
   let seen = 'nobody', score = 0;
   if (!withPrint) { drawWho(looking, 0); return; }
-  readExpression(f);
   if (f?.embedding?.length) {
     if (enrolling) enrolling.push(f.embedding.map(v => +v.toFixed(4)));
     if (faceprint) {
@@ -456,28 +455,132 @@ function drawWho(looking, score) {
 
 // Expressions: what your face is doing, not what you feel. A smile doesn't always mean happy,
 // so Desk says "you look like you're smiling", never "you're happy".
+// v1 used a tiny emotion-guessing model and got stuck between "neutral" and "down-turned" on the iPad.
+// v2 uses Google's face landmarker, which measures 52 face movements (smile, brows, jaw…), and compares them
+// with YOUR usual resting face, learned as you use it, so a resting face that naturally looks a bit serious reads as neutral.
 const EXPRESSIONS = {
-  happy: { emoji: '🙂', words: 'smiling' },
-  neutral: { emoji: '😐', words: 'neutral face' },
-  surprise: { emoji: '😮', words: 'surprised-looking' },
-  sad: { emoji: '🙁', words: 'down-turned face' },
-  angry: { emoji: '😠', words: 'frowning' },
-  fear: { emoji: '😟', words: 'worried-looking' },
-  disgust: { emoji: '😖', words: 'scrunched-up face' },
+  smiling:   { emoji: '🙂', words: 'smiling' },
+  neutral:   { emoji: '😐', words: 'neutral face' },
+  surprised: { emoji: '😮', words: 'surprised-looking' },
+  down:      { emoji: '🙁', words: 'down-turned face' },
+  frowning:  { emoji: '😠', words: 'frowning' },
+  worried:   { emoji: '😟', words: 'worried-looking' },
 };
-const EXPR_MIN = 0.4;   // ignore guesses the model isn't at least 40% sure about
-let exprHist = [], expression = null;
-function readExpression(f) {
-  const top = [...(f?.emotion || [])].sort((a, b) => b.score - a.score)[0];
-  exprHist.push(top && top.score >= EXPR_MIN && EXPRESSIONS[top.emotion] ? top.emotion : null);
-  if (exprHist.length > 5) exprHist.shift();
-  // Majority of the last 5 reads (about 2 seconds), so one odd frame doesn't flip it.
+let faceMarker = null, exprHist = [], expression = null, exprSince = 0, base = null, lastShapes = null;
+
+async function getFaceMarker(vision) {
+  if (faceMarker) return faceMarker;
+  faceMarker = await FaceLandmarker.createFromOptions(vision, {
+    baseOptions: { modelAssetPath: './models/face_landmarker.task', delegate: 'CPU' },
+    runningMode: 'VIDEO', numFaces: 1, outputFaceBlendshapes: true,
+  });
+  return faceMarker;
+}
+
+// The few face movements that matter here, each 0 (not at all) to 1 (fully).
+function faceShapes(result) {
+  const cats = result?.faceBlendshapes?.[0]?.categories;
+  if (!cats) return null;
+  const g = n => cats.find(c => c.categoryName === n)?.score || 0;
+  return {
+    smile: (g('mouthSmileLeft') + g('mouthSmileRight')) / 2,
+    frown: (g('mouthFrownLeft') + g('mouthFrownRight')) / 2,
+    browDown: (g('browDownLeft') + g('browDownRight')) / 2,
+    browUp: (g('browInnerUp') + (g('browOuterUpLeft') + g('browOuterUpRight')) / 2) / 2,
+    jaw: g('jawOpen'),
+  };
+}
+
+// Your resting face, learned slowly (about 30 s to settle) and only from calm-looking moments.
+function updateBase(sh) {
+  if (!base) { base = { ...sh }; return; }
+  const calm = Math.abs(sh.smile - base.smile) < 0.15 && Math.abs(sh.browDown - base.browDown) < 0.15 && sh.jaw < 0.3;
+  if (!calm) return;
+  for (const k in base) base[k] += (sh[k] - base[k]) * 0.01;
+}
+
+function classifyExpression(sh) {
+  const d = k => sh[k] - base[k];
+  if (sh.smile > 0.35 || d('smile') > 0.2) return 'smiling';
+  if (sh.jaw > 0.35 && (sh.browUp > 0.3 || d('browUp') > 0.2)) return 'surprised';
+  if (d('browDown') > 0.2) return 'frowning';
+  if (d('browUp') > 0.25) return 'worried';
+  if (d('frown') > 0.15) return 'down';
+  return 'neutral';
+}
+
+function readExpression(sh) {
+  lastShapes = sh;
+  if (!sh) { exprHist = []; return; }
+  updateBase(sh);
+  exprHist.push(classifyExpression(sh));
+  if (exprHist.length > 6) exprHist.shift();
+  // Most of the last 6 reads (about 1 second) have to agree, so one odd frame doesn't flip it.
   const counts = {};
-  for (const e of exprHist) if (e) counts[e] = (counts[e] || 0) + 1;
-  const [best, n] = Object.entries(counts).sort((a, b) => b[1] - a[1])[0] || [];
-  const next = n >= 3 ? best : expression && counts[expression] ? expression : null;
-  if (next !== expression && next) log(`face looks: ${EXPRESSIONS[next].words}`);
-  expression = next;
+  for (const e of exprHist) counts[e] = (counts[e] || 0) + 1;
+  const [best, n] = Object.entries(counts).sort((a, b) => b[1] - a[1])[0];
+  if (n >= 4 && best !== expression) {
+    const prev = expression;
+    expression = best;
+    exprSince = Date.now();
+    log(`face looks: ${EXPRESSIONS[best].words}`);
+    maybeCheckIn(prev);
+  }
+  if (expression && Date.now() - exprSince > 3000) maybeCheckIn(null);
+}
+
+// ================= Check-ins: noticing your face at a moment a person would, and asking about it =================
+// Only for smiling / down-turned / frowning / worried, only if it lasts 3 s, only if the brain is free,
+// at most once every 3 minutes, and never while you're typing. It asks or guesses; it never tells you what you feel.
+const CHECKIN_GAP_MS = 180000, CHECKIN_HOLD_MS = 3000;
+
+let lastCheckIn = 0, checkedFor = null;
+function maybeCheckIn() {
+  if (!['smiling', 'down', 'frowning', 'worried'].includes(expression)) { checkedFor = null; return; }
+  if (checkedFor === exprSince) return;                       // already asked about this one
+  if (Date.now() - exprSince < CHECKIN_HOLD_MS) return;
+  if (Date.now() - lastCheckIn < CHECKIN_GAP_MS) return;
+  if (!engine || busy || hearing || talking) return;
+  if (document.activeElement?.tagName === 'INPUT') return;
+  if (faceprint && who !== 'mukta') return;
+  if (awaySince) return;                                       // only if you're looking at the iPad
+  checkedFor = exprSince;
+  lastCheckIn = Date.now();
+  checkIn(expression);
+}
+
+// Desk says what it sees (fixed words), and the brain only guesses the reason from the conversation.
+const CHECKIN_OPENER = { smiling: 'I see you smiling.', down: 'You look a bit down.', frowning: 'I see you frowning.', worried: 'You look a bit worried.' };
+const CHECKIN_ASK = { smiling: 'What happened?', down: 'Everything OK?', frowning: 'Something annoying you?', worried: 'Want to talk about it?' };
+async function checkIn(expr) {
+  const recent = turns.filter(t => t.role === 'user').slice(-2).map(t => t.content.slice(0, 200)).join('\n');
+  let guess = '';
+  if (recent) {
+    busy = true; setInputs();
+    try {
+      const reply = await engine.chat.completions.create({
+        messages: [{ role: 'user', content:
+`Someone's face just started to look ${EXPRESSIONS[expr].words}. Their last messages were:
+${recent}
+If those messages give an obvious reason, write a yes/no question of at most 8 words guessing it, in the form "Is it about <the thing they mentioned>?".
+If there's no obvious reason, write exactly: NONE` }],
+        temperature: 0.3, max_tokens: 24, ...extra(),
+      });
+      const t = clean(reply.choices[0].message.content).split('\n')[0].replace(/^["']|["']$/g, '').trim();
+      if (/\?$/.test(t) && !/NONE/i.test(t) && t.split(/\s+/).length <= 10) guess = t;
+    } catch (err) {
+      log(`check-in error: ${err.message}`);
+    }
+    busy = false; setInputs();
+  }
+  const line = `${CHECKIN_OPENER[expr]} ${guess || CHECKIN_ASK[expr]}`;
+  log(`check-in: ${line}`);
+  bubble('ai', line);
+  // Keep it in the conversation so your reply makes sense to the brain.
+  const last = turns[turns.length - 1];
+  if (last?.role === 'assistant') last.content += `\n${line}`;
+  else turns.push({ role: 'assistant', content: line });
+  lastAnswer = line; lastAnswerAt = Date.now();
 }
 
 function setWho(next) {
@@ -933,6 +1036,7 @@ $('teachForm').addEventListener('submit', async e => {
 
 // ================= Eyes: hand gestures, run on the CPU so the GPU is left for the brain =================
 const HOLD_MS = 600;   // a gesture must be held this long before it counts
+let exprFrame = 0;
 let recognizer = null, gestureRaf = null, lastFrameAt = 0;
 let candidate = null, candidateSince = 0, confirmed = null;
 
@@ -944,6 +1048,7 @@ async function getRecognizer() {
     baseOptions: { modelAssetPath: './models/gesture_recognizer.task', delegate: 'CPU' },
     runningMode: 'VIDEO', numHands: 1,
   });
+  try { await getFaceMarker(vision); } catch (err) { log(`expression reader failed to load: ${err.message}`); }
   return recognizer;
 }
 
@@ -995,6 +1100,7 @@ async function startGestures() {
       const result = recognizer.recognizeForVideo(video, now);
       const name = classify(result);
       readHand(result, now);
+      if (faceMarker && ++exprFrame % 3 === 0) readExpression(faceShapes(faceMarker.detectForVideo(video, now)));
       if (name !== candidate) { candidate = name; candidateSince = now; }
       else if (name !== confirmed && now - candidateSince > HOLD_MS) {
         confirmed = name;
