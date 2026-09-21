@@ -4,43 +4,52 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Desk</title>
-<!-- Internet is only used to download code and model files. Camera frames, mic sound, questions and answers stay on the iPad. -->
+<!-- Internet is only used to download code and model files. Camera frames, mic sound, questions, answers, rules and the log stay on the iPad. -->
 <style>
   :root { --bg:#0A0B0D; --card:#17191E; --line:#262930; --text:#F4F4F2; --dim:#8B8E96; --on:#FF6A2C; --ok:#3DDC84; }
   * { box-sizing:border-box; }
   body { margin:0; background:var(--bg); color:var(--text); font:16px/1.4 system-ui, -apple-system, sans-serif;
          padding:max(16px, env(safe-area-inset-top)) 16px 32px; }
   h1 { font-size:22px; margin:0 0 2px; } .sub { color:var(--dim); margin:0 0 16px; font-size:13px; }
-  .layout { display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1.3fr); gap:14px; }
+  h2 { font-size:15px; margin:0; }
+  .layout { display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1.2fr); gap:14px; }
   .col { display:flex; flex-direction:column; gap:14px; min-width:0; }
   .card { background:var(--card); border:1px solid var(--line); border-radius:16px; padding:14px; }
-  .row { display:flex; gap:10px; }
+  .row { display:flex; gap:10px; align-items:center; }
   button { padding:14px; font:600 16px system-ui; border-radius:12px; border:2px solid var(--line);
            background:#0F1115; color:var(--text); cursor:pointer; }
   button.sw { flex:1; } button.on { border-color:var(--on); background:rgba(255,106,44,.15); }
   button.go { border-color:var(--on); background:rgba(255,106,44,.15); }
+  button.small { padding:6px 10px; font-size:13px; border-width:1px; }
   button:disabled { opacity:.4; cursor:default; }
   .state { margin-top:8px; font:12px ui-monospace, monospace; color:var(--dim); white-space:pre-wrap; }
   .stage { position:relative; margin-top:12px; }
   video { width:100%; aspect-ratio:4/3; background:#000; border-radius:10px; object-fit:cover; transform:scaleX(-1); display:block; }
-  .gesture { position:absolute; left:10px; bottom:10px; padding:6px 12px; border-radius:999px; background:rgba(0,0,0,.65);
-             font:600 18px system-ui; }
+  .gesture { position:absolute; left:10px; bottom:10px; padding:6px 12px; border-radius:999px; background:rgba(0,0,0,.65); font:600 18px system-ui; }
   .bar { height:10px; background:#000; border-radius:5px; margin-top:10px; overflow:hidden; }
   .bar i { display:block; height:100%; width:0; background:var(--on); }
-  #chat { display:flex; flex-direction:column; gap:10px; max-height:52vh; overflow:auto; margin-top:12px; }
+  #timer { font:700 44px ui-monospace, monospace; text-align:center; margin:6px 0; }
+  #timer.done { color:var(--on); animation:flash 1s 4; }
+  @keyframes flash { 50% { opacity:.2; } }
+  #chat { display:flex; flex-direction:column; gap:10px; max-height:40vh; overflow:auto; margin-top:12px; }
   .msg { padding:10px 14px; border-radius:12px; max-width:90%; white-space:pre-wrap; }
   .me { align-self:flex-end; background:rgba(255,106,44,.18); }
   .ai { align-self:flex-start; background:#0F1115; border:1px solid var(--line); }
   form { display:flex; gap:8px; margin-top:12px; }
+  select { padding:8px; font:14px system-ui; border-radius:8px; background:#0F1115; color:var(--text); border:1px solid var(--line); }
   input { flex:1; min-width:0; padding:14px; font:16px system-ui; border-radius:12px; border:1px solid var(--line); background:#0F1115; color:var(--text); }
-  ol#log { font:12px ui-monospace, monospace; color:var(--dim); margin:8px 0 0; padding-left:20px; max-height:180px; overflow:auto; }
+  .proposal { margin-top:12px; padding:12px; border:2px dashed var(--on); border-radius:12px; }
+  .proposal .big { font:600 18px system-ui; margin:4px 0 10px; }
+  ul.rules { list-style:none; margin:10px 0 0; padding:0; display:flex; flex-direction:column; gap:6px; }
+  ul.rules li { display:flex; justify-content:space-between; align-items:center; gap:8px; padding:8px 10px; background:#0F1115; border-radius:10px; }
+  ol#log { font:12px ui-monospace, monospace; color:var(--dim); margin:8px 0 0; padding-left:20px; max-height:200px; overflow:auto; }
   .pass { color:var(--ok); } .fail { color:var(--on); }
   @media (max-width:760px) { .layout { grid-template-columns:1fr; } }
 </style>
 </head>
 <body>
 <h1>Desk</h1>
-<p class="sub">Camera and mic start OFF, and leaving the page turns them off. Gestures are only recognised and logged for now; they don't trigger anything until step 4.</p>
+<p class="sub">Camera and mic start OFF and switch off when you leave. The brain can only <b>suggest</b> gesture rules, and nothing changes until you tap Approve.</p>
 
 <div class="layout">
   <div class="col">
@@ -58,12 +67,37 @@
     </div>
 
     <div class="card">
-      <strong>Log</strong> <span class="state">(on this screen only, gone on reload)</span>
+      <h2>Timer</h2>
+      <div id="timer">--:--</div>
+    </div>
+
+    <div class="card">
+      <div class="row" style="justify-content:space-between">
+        <h2>Log</h2><button class="small" id="clearLog">Clear log</button>
+      </div>
+      <div class="state">saved on this iPad only</div>
       <ol id="log"></ol>
     </div>
   </div>
 
   <div class="col">
+    <div class="card">
+      <h2>Teach Desk a gesture</h2>
+      <div class="state">e.g. "when I do thumbs up, start a 25 minute timer". The brain turns what you say into a suggestion, and you decide.</div>
+      <form id="teachForm">
+        <input id="teach" placeholder="When I do … , …" autocomplete="off" disabled>
+        <button class="go" id="teachBtn" disabled>Suggest</button>
+      </form>
+      <div id="proposal"></div>
+      <div class="row" style="margin-top:12px; flex-wrap:wrap">
+        <span class="state" style="margin:0">Or make one yourself:</span>
+        <select id="pickG"></select> → <select id="pickA"></select>
+        <button class="small go" id="addRule">Add</button>
+      </div>
+      <ul class="rules" id="rules"></ul>
+      <div class="state">What gestures can do: <span id="menuList"></span></div>
+    </div>
+
     <div class="card">
       <button class="go" id="loadBtn">Load the brain</button>
       <div class="bar"><i id="loadBar"></i></div>
@@ -83,11 +117,19 @@ import * as webllm from 'https://cdn.jsdelivr.net/npm/@mlc-ai/web-llm@0.2.85/+es
 
 const $ = id => document.getElementById(id);
 
-function log(msg) {
-  const li = document.createElement('li');
-  li.textContent = new Date().toLocaleTimeString() + '  ' + msg;
-  $('log').prepend(li);
+// ================= Log: kept in this iPad's storage, never sent anywhere =================
+const LOG_KEY = 'desk.log', LOG_MAX = 300;
+let logLines = JSON.parse(localStorage.getItem(LOG_KEY) || '[]');
+function drawLog() {
+  $('log').replaceChildren(...logLines.map(line => { const li = document.createElement('li'); li.textContent = line; return li; }));
 }
+function log(msg) {
+  logLines.unshift(new Date().toLocaleString('en-GB', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit', second: '2-digit' }) + '  ' + msg);
+  logLines = logLines.slice(0, LOG_MAX);
+  localStorage.setItem(LOG_KEY, JSON.stringify(logLines));
+  drawLog();
+}
+$('clearLog').addEventListener('click', () => { logLines = []; localStorage.removeItem(LOG_KEY); log('log cleared'); });
 
 // ================= Sensors: one stream each; OFF stops every track so the OS releases the hardware =================
 const sensors = {
@@ -105,6 +147,7 @@ function render() {
   $('sensorState').textContent = `camera tracks live: ${liveTracks(sensors.cam)} · mic tracks live: ${liveTracks(sensors.mic)}`;
 }
 
+// Only a tap on the button can switch a sensor ON. Rules and the brain can only ever switch them OFF.
 async function turnOn(key) {
   const s = sensors[key];
   try {
@@ -165,10 +208,186 @@ function stopMeter() {
   $('level').style.width = '0'; $('meter').hidden = true;
 }
 
+// ================= Timer =================
+let timerEnd = 0, timerId = null;
+function drawTimer() {
+  const left = Math.max(0, Math.round((timerEnd - Date.now()) / 1000));
+  $('timer').textContent = `${String(Math.floor(left / 60)).padStart(2, '0')}:${String(left % 60).padStart(2, '0')}`;
+  if (left === 0) {
+    clearInterval(timerId); timerId = null;
+    $('timer').classList.add('done');
+    say('Timer done');
+    log('timer finished');
+  }
+}
+function startTimer(mins) {
+  clearInterval(timerId);
+  $('timer').classList.remove('done');
+  timerEnd = Date.now() + mins * 60000;
+  timerId = setInterval(drawTimer, 250);
+  drawTimer();
+}
+function stopTimer() {
+  clearInterval(timerId); timerId = null;
+  $('timer').classList.remove('done');
+  $('timer').textContent = '--:--';
+}
+
+// Uses the iPad's built-in voices.
+function say(text) {
+  if (!('speechSynthesis' in window)) return;
+  speechSynthesis.cancel();
+  speechSynthesis.speak(new SpeechSynthesisUtterance(text));
+}
+
+// ================= The action menu: the ONLY things a gesture can ever do =================
+// The brain can't add to this list. Anything it suggests that isn't here gets thrown out.
+const ACTIONS = {
+  timer_25:      { label: 'start a 25-min focus timer', run: () => startTimer(25) },
+  timer_5:       { label: 'start a 5-min break timer',  run: () => startTimer(5) },
+  timer_1:       { label: 'start a 1-min timer',        run: () => startTimer(1) },
+  timer_stop:    { label: 'stop the timer',             run: stopTimer },
+  fun_fact:      { label: 'brain tells a fun fact',     run: () => askBrain('Tell me one surprising fun fact about science or engineering, in two sentences.', true) },
+  motivate:      { label: 'brain says something encouraging', run: () => askBrain('Say one short, genuine line of encouragement for someone about to do focused work. No clichés.', true) },
+  read_aloud:    { label: 'read the last answer aloud', run: readLastAnswer },
+  camera_off:    { label: 'turn the camera OFF',        run: () => turnOff('cam') },
+  everything_off:{ label: 'turn camera + mic OFF',      run: () => allOff('gesture') },
+};
+$('menuList').textContent = Object.values(ACTIONS).map(a => a.label).join(' · ');
+
+const GESTURES = {
+  Closed_Fist: '✊ fist', Open_Palm: '✋ open palm', Pointing_Up: '☝️ point up',
+  Thumb_Up: '👍 thumbs up', Thumb_Down: '👎 thumbs down', Victory: '✌️ peace', ILoveYou: '🤟 love you',
+};
+// Plain words the brain works with (a 1B model matches "thumbs_up" far better than "Thumb_Up").
+const GESTURE_WORDS = {
+  fist: 'Closed_Fist', open_palm: 'Open_Palm', point_up: 'Pointing_Up',
+  thumbs_up: 'Thumb_Up', thumbs_down: 'Thumb_Down', peace: 'Victory', love_you: 'ILoveYou',
+};
+const GESTURE_HINTS = {
+  fist: 'closed fist, closed hand', open_palm: 'open hand, palm, high five, wave, stop hand', point_up: 'pointing up, one finger',
+  thumbs_up: 'thumbs up, thumb up', thumbs_down: 'thumbs down, thumb down', peace: 'peace sign, V sign, two fingers, victory',
+  love_you: 'I love you sign, rock sign',
+};
+
+// ================= Rules: gesture → action. Saved on this iPad. =================
+const RULES_KEY = 'desk.rules', REJECTED_KEY = 'desk.rejected';
+let rules = JSON.parse(localStorage.getItem(RULES_KEY) || '{}');
+const rejected = new Set(JSON.parse(localStorage.getItem(REJECTED_KEY) || '[]'));
+
+// Re-check saved rules on load, so a rule edited into storage by hand can't point at something off the menu.
+for (const [g, a] of Object.entries(rules)) if (!GESTURES[g] || !ACTIONS[a]) delete rules[g];
+
+function saveRules() { localStorage.setItem(RULES_KEY, JSON.stringify(rules)); drawRules(); }
+function drawRules() {
+  const items = Object.entries(rules).map(([g, a]) => {
+    const li = document.createElement('li');
+    li.innerHTML = `<span>${GESTURES[g]} → ${ACTIONS[a].label}</span>`;
+    const del = document.createElement('button');
+    del.className = 'small'; del.textContent = 'Remove';
+    // Removing a rule takes power away, so it doesn't need a second approval.
+    del.addEventListener('click', () => { delete rules[g]; saveRules(); log(`rule removed: ${GESTURES[g]}`); });
+    li.append(del);
+    return li;
+  });
+  if (!items.length) { const li = document.createElement('li'); li.textContent = 'No rules yet. Gestures are only logged.'; items.push(li); }
+  $('rules').replaceChildren(...items);
+}
+
+const COOLDOWN_MS = 3000;
+const lastFired = {};
+function onGesture(g) {
+  log(`gesture: ${GESTURES[g]}`);
+  const a = rules[g];
+  if (!a || !ACTIONS[a]) return;
+  if (Date.now() - (lastFired[g] || 0) < COOLDOWN_MS) return;
+  lastFired[g] = Date.now();
+  log(`rule used: ${GESTURES[g]} → ${ACTIONS[a].label}`);
+  ACTIONS[a].run();
+}
+
+// ================= The gate: a suggestion must pass the checks, then get your tap =================
+function validate(p) {
+  if (!p || typeof p !== 'object') return 'not a proper suggestion';
+  if (p.gesture === 'none' || p.action === 'none') return 'the brain could not match that to a gesture and an action it is allowed to use';
+  if (!GESTURES[p.gesture]) return `"${p.gesture}" isn't a gesture Desk can see`;
+  if (!ACTIONS[p.action]) return `"${p.action}" isn't on the action menu`;
+  if (rules[p.gesture] === p.action) return 'that rule already exists';
+  if (rejected.has(`${p.gesture}>${p.action}`)) return 'you already rejected this exact rule, so it is blocked';
+  return null;
+}
+
+function showProposal(p) {
+  const box = document.createElement('div');
+  box.className = 'proposal';
+  const replacing = rules[p.gesture] ? `<div class="state fail">This replaces: ${GESTURES[p.gesture]} → ${ACTIONS[rules[p.gesture]].label}</div>` : '';
+  box.innerHTML = `<div class="state">The brain suggests:</div><div class="big">${GESTURES[p.gesture]} → ${ACTIONS[p.action].label}</div>${replacing}`;
+  const row = document.createElement('div'); row.className = 'row';
+  const yes = document.createElement('button'); yes.className = 'go'; yes.textContent = 'Approve';
+  const no = document.createElement('button'); no.textContent = 'Reject';
+  yes.addEventListener('click', () => {
+    rules[p.gesture] = p.action; saveRules();
+    log(`APPROVED: ${GESTURES[p.gesture]} → ${ACTIONS[p.action].label}`);
+    box.remove();
+  });
+  no.addEventListener('click', () => {
+    rejected.add(`${p.gesture}>${p.action}`);
+    localStorage.setItem(REJECTED_KEY, JSON.stringify([...rejected]));
+    log(`REJECTED: ${GESTURES[p.gesture]} → ${ACTIONS[p.action].label}`);
+    box.remove();
+  });
+  row.append(yes, no); box.append(row);
+  $('proposal').replaceChildren(box);
+}
+
+// The brain answers two small multiple-choice questions instead of one big one; a 1B model is much more reliable that way.
+// Its answers are forced to be one of the listed options, and are still checked again by validate().
+async function pick(question, request, options) {
+  const list = Object.entries(options).map(([k, v]) => `${k} = ${v}`).join('\n');
+  const reply = await engine.chat.completions.create({
+    messages: [{ role: 'user', content: `${question}\nOptions:\n${list}\nnone = nothing in the list fits\n\nRequest: "${request}"\nReply with JSON only.` }],
+    temperature: 0,
+    response_format: { type: 'json_object', schema: JSON.stringify({
+      type: 'object', properties: { choice: { type: 'string', enum: [...Object.keys(options), 'none'] } }, required: ['choice'],
+    }) },
+  });
+  return JSON.parse(reply.choices[0].message.content).choice;
+}
+
+async function propose(request) {
+  const word = await pick('Which hand gesture does this request mention?', request, GESTURE_HINTS);
+  const action = await pick('What should happen when the gesture is made? Pick the closest action.', request,
+    Object.fromEntries(Object.entries(ACTIONS).map(([k, v]) => [k, v.label])));
+  return { gesture: GESTURE_WORDS[word] || word, action };
+}
+
+$('teachForm').addEventListener('submit', async e => {
+  e.preventDefault();
+  const request = $('teach').value.trim();
+  if (!request || !engine || busy) return;
+  busy = true; setInputs();
+  $('proposal').innerHTML = '<div class="state">thinking…</div>';
+  log(`teach request: ${request.slice(0, 80)}`);
+  let p = null, reason = null;
+  try {
+    p = await propose(request);
+    reason = validate(p);
+  } catch (err) {
+    reason = `the brain's reply couldn't be read (${err.message})`;
+  }
+  if (reason) {
+    $('proposal').innerHTML = `<div class="state fail">Thrown out: ${reason}.</div>`;
+    log(`suggestion thrown out: ${reason}`);
+  } else {
+    $('teach').value = '';
+    showProposal(p);
+    log(`suggestion waiting for approval: ${GESTURES[p.gesture]} → ${ACTIONS[p.action].label}`);
+  }
+  busy = false; setInputs();
+});
+
 // ================= Eyes: hand gestures, run on the CPU so the GPU is left for the brain =================
-const GESTURE_NAMES = { Closed_Fist: '✊ fist', Open_Palm: '✋ open palm', Pointing_Up: '☝️ point up',
-  Thumb_Up: '👍 thumbs up', Thumb_Down: '👎 thumbs down', Victory: '✌️ peace', ILoveYou: '🤟 love you' };
-const HOLD_MS = 600;          // a gesture must be held this long before it counts, so passing hand shapes aren't logged
+const HOLD_MS = 600;   // a gesture must be held this long before it counts
 let recognizer = null, gestureRaf = null, lastFrameAt = 0;
 let candidate = null, candidateSince = 0, confirmed = null;
 
@@ -191,20 +410,20 @@ async function startGestures() {
     log(`gesture model failed to load: ${err.message}`);
     return;
   }
-  if (!sensors.cam.stream) return;   // camera was switched off while the model loaded
+  if (!sensors.cam.stream) return;
   const video = $('video');
   const loop = now => {
     if (!sensors.cam.stream) return;
-    if (now - lastFrameAt > 66 && video.readyState >= 2) {   // ~15 checks a second is plenty
+    if (now - lastFrameAt > 66 && video.readyState >= 2) {
       lastFrameAt = now;
       const top = recognizer.recognizeForVideo(video, now).gestures[0]?.[0];
       const name = top && top.categoryName !== 'None' && top.score > 0.6 ? top.categoryName : null;
       if (name !== candidate) { candidate = name; candidateSince = now; }
       else if (name !== confirmed && now - candidateSince > HOLD_MS) {
         confirmed = name;
-        if (name) log(`gesture: ${GESTURE_NAMES[name] || name}`);
+        if (name) onGesture(name);
       }
-      $('gesture').textContent = confirmed ? (GESTURE_NAMES[confirmed] || confirmed) : 'no gesture';
+      $('gesture').textContent = confirmed ? GESTURES[confirmed] : 'no gesture';
     }
     gestureRaf = requestAnimationFrame(loop);
   };
@@ -219,9 +438,14 @@ function stopGestures() {
 // ================= Brain: small model running on the iPad's GPU =================
 const MODEL_F16 = 'Llama-3.2-1B-Instruct-q4f16_1-MLC';
 const MODEL_F32 = 'Llama-3.2-1B-Instruct-q4f32_1-MLC';
-const MAX_TURNS = 6;   // only the last few exchanges are sent back in, so a long chat doesn't run the iPad out of memory
-let engine = null;
+const MAX_TURNS = 6;
+let engine = null, busy = false;
 const turns = [];
+
+function setInputs() {
+  const ready = !!engine && !busy;
+  for (const id of ['q', 'send', 'teach', 'teachBtn']) $(id).disabled = !ready;
+}
 
 function systemPrompt() {
   const now = new Date().toLocaleString('en-GB', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric', hour: '2-digit', minute: '2-digit' });
@@ -235,6 +459,37 @@ function bubble(cls, text) {
   d.className = 'msg ' + cls; d.textContent = text;
   $('chat').append(d); $('chat').scrollTop = $('chat').scrollHeight;
   return d;
+}
+
+let lastAnswer = '';
+function readLastAnswer() {
+  if (lastAnswer) say(lastAnswer); else log('nothing to read aloud yet');
+}
+
+async function askBrain(q, speak = false) {
+  if (!engine) { log('brain not loaded, so that action was skipped'); return; }
+  if (busy) { log('brain busy, so that action was skipped'); return; }
+  busy = true; setInputs();
+  bubble('me', q);
+  turns.push({ role: 'user', content: q });
+  const out = bubble('ai', '…');
+  let text = '';
+  try {
+    const messages = [{ role: 'system', content: systemPrompt() }, ...turns.slice(-MAX_TURNS * 2)];
+    const stream = await engine.chat.completions.create({ messages, stream: true, temperature: 0.6 });
+    for await (const chunk of stream) {
+      text += chunk.choices[0]?.delta?.content || '';
+      out.textContent = text; $('chat').scrollTop = $('chat').scrollHeight;
+    }
+    turns.push({ role: 'assistant', content: text });
+    lastAnswer = text;
+    if (speak) say(text);
+  } catch (err) {
+    turns.pop();
+    out.textContent = `Error: ${err.message}`; out.classList.add('fail');
+    log(`brain error: ${err.message}`);
+  }
+  busy = false; setInputs();
 }
 
 $('loadBtn').addEventListener('click', async () => {
@@ -256,35 +511,30 @@ $('loadBtn').addEventListener('click', async () => {
   $('brainState').innerHTML = `<span class="pass">Brain ready</span> (${model}, ${secs} s)`;
   $('loadBtn').hidden = true;
   log(`brain loaded in ${secs} s`);
-  $('q').disabled = false; $('send').disabled = false;
+  setInputs();
 });
 
-$('form').addEventListener('submit', async e => {
+$('form').addEventListener('submit', e => {
   e.preventDefault();
   const q = $('q').value.trim();
-  if (!q || !engine) return;
-  $('q').value = ''; $('q').disabled = true; $('send').disabled = true;
-  bubble('me', q);
+  if (!q) return;
+  $('q').value = '';
   log(`asked: ${q.slice(0, 60)}`);
-  turns.push({ role: 'user', content: q });
-  const out = bubble('ai', '…');
-  let text = '';
-  try {
-    const messages = [{ role: 'system', content: systemPrompt() }, ...turns.slice(-MAX_TURNS * 2)];
-    const stream = await engine.chat.completions.create({ messages, stream: true, temperature: 0.4 });
-    for await (const chunk of stream) {
-      text += chunk.choices[0]?.delta?.content || '';
-      out.textContent = text; $('chat').scrollTop = $('chat').scrollHeight;
-    }
-    turns.push({ role: 'assistant', content: text });
-  } catch (err) {
-    turns.pop();
-    out.textContent = `Error: ${err.message}`; out.classList.add('fail');
-    log(`brain error: ${err.message}`);
-  }
-  $('q').disabled = false; $('send').disabled = false;
+  askBrain(q);
 });
 
+// Making a rule yourself: you ARE the approver, so no second step. Same menu, same checks.
+$('pickG').innerHTML = Object.entries(GESTURES).map(([k, v]) => `<option value="${k}">${v}</option>`).join('');
+$('pickA').innerHTML = Object.entries(ACTIONS).map(([k, v]) => `<option value="${k}">${v.label}</option>`).join('');
+$('addRule').addEventListener('click', () => {
+  const g = $('pickG').value, a = $('pickA').value;
+  if (!GESTURES[g] || !ACTIONS[a]) return;
+  rules[g] = a; saveRules();
+  log(`rule added by you: ${GESTURES[g]} → ${ACTIONS[a].label}`);
+});
+
+drawLog();
+drawRules();
 render();
 log('page loaded, camera OFF, mic OFF, brain not loaded');
 </script>
