@@ -69,6 +69,15 @@
     </div>
 
     <div class="card">
+      <div class="row" style="justify-content:space-between"><h2>Who's there</h2><span class="state" id="who" style="margin:0">camera off</span></div>
+      <div class="row" style="margin-top:8px">
+        <button class="small go" id="learnFace">Learn my face</button>
+        <button class="small" id="forgetFace">Forget my face</button>
+      </div>
+      <div class="state" id="faceState"></div>
+    </div>
+
+    <div class="card">
       <h2>Timer</h2>
       <div id="timer">--:--</div>
     </div>
@@ -165,7 +174,7 @@ async function turnOn(key) {
     s.stream = null; render(); return;
   }
   s.stream.getTracks().forEach(t => t.addEventListener('ended', () => { log(`${s.label} track ended by the system`); turnOff(key); }));
-  if (key === 'cam') { $('video').srcObject = s.stream; $('stage').hidden = false; await $('video').play(); startGestures(); }
+  if (key === 'cam') { $('video').srcObject = s.stream; $('stage').hidden = false; await $('video').play(); startGestures(); startFace(); }
   if (key === 'mic') startMeter(s.stream);
   log(`${s.label} ON`);
   render();
@@ -177,7 +186,7 @@ function turnOff(key) {
   s.stream.getTracks().forEach(t => t.stop());
   const stillLive = liveTracks(s);
   s.stream = null;
-  if (key === 'cam') { stopGestures(); $('video').srcObject = null; $('stage').hidden = true; }
+  if (key === 'cam') { stopGestures(); stopFace(); $('video').srcObject = null; $('stage').hidden = true; }
   if (key === 'mic') stopMeter();
   log(`${s.label} OFF, tracks still live: ${stillLive}`);
   render();
@@ -302,11 +311,165 @@ async function handleSpeech(clip, rate) {
     return;
   }
   if (!engine) { log('heard something, but the brain is not loaded'); ears('👂 listening (load the brain so I can answer)'); return; }
+  const no = blockedReason('voice question');
+  if (no) { sayOnce(no); if (sensors.mic.stream) ears('👂 listening'); return; }
   log(`voice question: ${text.slice(0, 60)}`);
   // Your words are not shown in the chat, only the answer. They stay in the log.
   await askBrain(text, true, false);
   if (sensors.mic.stream) ears('👂 listening');
 }
+
+// ================= Face: who's there + where you're looking (Human library, runs on the iPad) =================
+// Your face is kept as a "face fingerprint" (1,024 numbers per sample), never as a photo, and only in this iPad's storage.
+const HUMAN_URL = 'https://cdn.jsdelivr.net/npm/@vladmandic/human@3.3.6';
+const FACE_KEY = 'desk.face';
+const MATCH = 0.55;          // similarity above this counts as Mukta (Human's guide: above 0.5 is a match)
+const LOOK_AWAY_MS = 1000;   // head turned away (or gone) this long while Desk is talking = stop talking
+const GREET_GAP_MS = 120000; // don't say hi again within 2 minutes
+let human = null, humanLoading = null, faceTimer = null, faceRun = 0;
+let faceprint = JSON.parse(localStorage.getItem(FACE_KEY) || 'null');
+let who = 'nobody', whoVotes = [], awaySince = 0, enrolling = null;
+const lastGreet = {};
+
+function drawFaceState() {
+  $('faceState').textContent = faceprint
+    ? `Face learned (${faceprint.length} samples). Desk only takes orders when it can see you.`
+    : 'No face learned yet, so anyone can use Desk.';
+}
+
+// With a learned face, Desk only obeys when it can see Mukta right now. Returns why not, or null if it's fine.
+function blockedReason(what) {
+  if (!faceprint || who === 'mukta') return null;
+  const why = !sensors.cam.stream ? 'turn the camera on so I can see it is you' : 'I only take that from Mukta';
+  log(`blocked ${what}: ${why}`);
+  return why;
+}
+const saidAt = {};
+function sayOnce(text) {   // don't repeat the same refusal more than every 20 s
+  if (Date.now() - (saidAt[text] || 0) < 20000) return;
+  saidAt[text] = Date.now();
+  say(`Sorry, ${text}.`);
+}
+
+async function getHuman() {
+  if (human) return human;
+  if (!humanLoading) {
+    humanLoading = (async () => {
+      const { Human } = await import(`${HUMAN_URL}/dist/human.esm.js`);
+      const h = new Human({
+        modelBasePath: `${HUMAN_URL}/models/`, backend: 'webgl', debug: false,
+        filter: { enabled: false }, gesture: { enabled: false }, body: { enabled: false }, hand: { enabled: false },
+        object: { enabled: false }, segmentation: { enabled: false },
+        face: { enabled: true, detector: { rotation: true, maxDetected: 1 }, mesh: { enabled: true }, iris: { enabled: false },
+                description: { enabled: true }, emotion: { enabled: false }, antispoof: { enabled: false }, liveness: { enabled: false } },
+      });
+      await h.load();
+      await h.warmup();
+      human = h;
+      log('face tracker loaded');
+      return h;
+    })().catch(err => { humanLoading = null; throw err; });
+  }
+  return humanLoading;
+}
+
+async function startFace() {
+  const run = ++faceRun;   // if the camera is switched off and on quickly, only the newest loop keeps going
+  $('who').textContent = 'loading face tracker…';
+  try { await getHuman(); } catch (err) {
+    log(`face tracker failed to load: ${err.message}`);
+    $('who').textContent = 'face tracker failed';
+    return;
+  }
+  const tick = async () => {
+    if (run !== faceRun || !sensors.cam.stream) return;
+    try { await faceStep(); } catch (err) { log(`face error: ${err.message}`); }
+    faceTimer = setTimeout(tick, 250);   // 4 checks a second is plenty
+  };
+  tick();
+}
+function stopFace() {
+  faceRun++;
+  clearTimeout(faceTimer);
+  who = 'nobody'; whoVotes = []; awaySince = 0; enrolling = null;
+  $('who').textContent = 'camera off';
+}
+
+async function faceStep() {
+  const res = await human.detect($('video'));
+  const f = res.face[0];
+  const now = performance.now();
+
+  // Looking at the iPad? No face, or head turned more than ~30°, counts as away.
+  const a = f?.rotation?.angle;
+  const looking = !!a && Math.abs(a.yaw) < 0.5 && Math.abs(a.pitch) < 0.45;
+  if (looking) awaySince = 0;
+  else if (!awaySince) awaySince = now;
+  if (awaySince && now - awaySince > LOOK_AWAY_MS && speechSynthesis.speaking) {
+    speechSynthesis.cancel();
+    log('stopped talking: you looked away');
+    if (sensors.mic.stream) ears('👂 listening');
+  }
+
+  // Who is it? Needs 3 checks in a row to agree before it changes its mind.
+  let seen = 'nobody', score = 0;
+  if (f?.embedding?.length) {
+    if (enrolling) enrolling.push(f.embedding.map(v => +v.toFixed(4)));
+    if (faceprint) {
+      score = human.match.find(f.embedding, faceprint).similarity;
+      seen = score > MATCH ? 'mukta' : 'someone';
+    } else seen = 'someone';
+  }
+  whoVotes.push(seen);
+  if (whoVotes.length > 3) whoVotes.shift();
+  if (whoVotes.length === 3 && whoVotes.every(v => v === seen) && seen !== who) setWho(seen);
+
+  const label = who === 'mukta' ? '👤 Mukta' : who === 'someone' ? (faceprint ? '👤 someone else' : '👤 a face') : 'nobody';
+  $('who').textContent = `${label}${score ? ` (${score.toFixed(2)})` : ''} · ${looking ? 'looking at iPad' : 'looking away'}`;
+}
+
+function setWho(next) {
+  const prev = who;
+  who = next;
+  if (next === 'nobody') { log('nobody in view'); return; }
+  log(`sees: ${next === 'mukta' ? 'Mukta' : faceprint ? 'someone else' : 'a face'}`);
+  if (prev === 'nobody' && Date.now() - (lastGreet[next] || 0) > GREET_GAP_MS) {
+    lastGreet[next] = Date.now();
+    say(next === 'mukta' ? 'Hi Mukta!' : 'Hi there!');
+  }
+}
+
+$('learnFace').addEventListener('click', async () => {
+  if (!sensors.cam.stream) { $('faceState').textContent = 'Turn the camera on first.'; return; }
+  if (!human) { $('faceState').textContent = 'Face tracker is still loading, try again in a moment.'; return; }
+  if (faceprint && who !== 'mukta') { $('faceState').textContent = "A face is already learned and I can't see it right now."; return; }
+  enrolling = [];
+  for (let s = 5; s > 0; s--) {
+    $('faceState').textContent = `Learning… look at the camera and turn your head a little (${s})`;
+    await new Promise(r => setTimeout(r, 1000));
+  }
+  const samples = enrolling || [];
+  enrolling = null;
+  if (samples.length < 5) { $('faceState').textContent = `Only got ${samples.length} good looks at your face. Try again in better light.`; return; }
+  const step = Math.max(1, Math.floor(samples.length / 12));
+  faceprint = samples.filter((_, i) => i % step === 0).slice(0, 12);
+  localStorage.setItem(FACE_KEY, JSON.stringify(faceprint));
+  who = 'nobody'; whoVotes = [];
+  log(`face learned (${faceprint.length} samples)`);
+  drawFaceState();
+});
+
+// Forgetting also needs Mukta in view, or anyone could wipe her face and learn their own.
+// Escape hatch if it stops recognising her: Settings → Safari → Advanced → Website Data → delete apeq591.github.io.
+$('forgetFace').addEventListener('click', () => {
+  if (!faceprint) { $('faceState').textContent = 'No face is learned.'; return; }
+  if (blockedReason('forget face')) { $('faceState').textContent = 'Only Mukta can make me forget her face (camera on, looking at me).'; return; }
+  if (!confirm('Delete your face fingerprint from this iPad?')) return;
+  faceprint = null; who = 'nobody'; whoVotes = [];
+  localStorage.removeItem(FACE_KEY);
+  log('face forgotten');
+  drawFaceState();
+});
 
 // ================= Timer =================
 let timerEnd = 0, timerId = null;
@@ -404,6 +567,7 @@ function onGesture(g) {
   const a = rules[g];
   if (!a || !ACTIONS[a]) return;
   if (Date.now() - (lastFired[g] || 0) < COOLDOWN_MS) return;
+  if (blockedReason(`rule ${GESTURES[g]}`)) { lastFired[g] = Date.now(); return; }
   lastFired[g] = Date.now();
   log(`rule used: ${GESTURES[g]} → ${ACTIONS[a].label}`);
   ACTIONS[a].run();
@@ -429,6 +593,8 @@ function showProposal(p) {
   const yes = document.createElement('button'); yes.className = 'go'; yes.textContent = 'Approve';
   const no = document.createElement('button'); no.textContent = 'Reject';
   yes.addEventListener('click', () => {
+    const no = blockedReason('approve');
+    if (no) { box.querySelector('.state').textContent = `Can't approve: ${no}.`; return; }
     rules[p.gesture] = p.action; saveRules();
     log(`APPROVED: ${GESTURES[p.gesture]} → ${ACTIONS[p.action].label}`);
     box.remove();
@@ -468,6 +634,8 @@ $('teachForm').addEventListener('submit', async e => {
   e.preventDefault();
   const request = $('teach').value.trim();
   if (!request || !engine || busy) return;
+  const no = blockedReason('teach');
+  if (no) { $('proposal').innerHTML = `<div class="state fail">Not now: ${no}.</div>`; return; }
   busy = true; setInputs();
   $('proposal').innerHTML = '<div class="state">thinking…</div>';
   log(`teach request: ${request.slice(0, 80)}`);
@@ -669,6 +837,8 @@ $('form').addEventListener('submit', e => {
   e.preventDefault();
   const q = $('q').value.trim();
   if (!q) return;
+  const no = blockedReason('typed question');
+  if (no) { bubble('ai', `Sorry, ${no}.`); return; }
   $('q').value = '';
   log(`asked: ${q.slice(0, 60)}`);
   askBrain(q);
@@ -680,6 +850,8 @@ $('pickA').innerHTML = Object.entries(ACTIONS).map(([k, v]) => `<option value="$
 $('addRule').addEventListener('click', () => {
   const g = $('pickG').value, a = $('pickA').value;
   if (!GESTURES[g] || !ACTIONS[a]) return;
+  const no = blockedReason('add rule');
+  if (no) { $('proposal').innerHTML = `<div class="state fail">Not now: ${no}.</div>`; return; }
   rules[g] = a; saveRules();
   log(`rule added by you: ${GESTURES[g]} → ${ACTIONS[a].label}`);
 });
@@ -715,6 +887,7 @@ $('spaceBtn').addEventListener('click', checkSpace);
 
 drawLog();
 drawRules();
+drawFaceState();
 render();
 log('page loaded, camera OFF, mic OFF, brain not loaded');
 </script>
