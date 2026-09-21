@@ -373,7 +373,7 @@ async function getHuman() {
         filter: { enabled: false }, gesture: { enabled: false }, body: { enabled: false }, hand: { enabled: false },
         object: { enabled: false }, segmentation: { enabled: false },
         face: { enabled: true, detector: { rotation: true, maxDetected: 1 }, mesh: { enabled: true }, iris: { enabled: false },
-                description: { enabled: true }, emotion: { enabled: false }, antispoof: { enabled: false }, liveness: { enabled: false } },
+                description: { enabled: true }, emotion: { enabled: true }, antispoof: { enabled: false }, liveness: { enabled: false } },
       });
       await h.load();
       await h.warmup();
@@ -403,7 +403,7 @@ async function startFace() {
 function stopFace() {
   faceRun++;
   clearTimeout(faceTimer);
-  who = 'nobody'; whoVotes = []; awaySince = 0; enrolling = null; presentSince = 0; headHist = [];
+  who = 'nobody'; whoVotes = []; awaySince = 0; enrolling = null; presentSince = 0; headHist = []; exprHist = []; expression = null;
   $('who').textContent = 'camera off';
 }
 
@@ -411,7 +411,7 @@ async function faceStep() {
   // The face fingerprint is the slow part, so it only runs every 4th frame; head movement is read on every frame.
   faceFrame++;
   const withPrint = faceFrame % 4 === 0 || !!enrolling;
-  const res = await human.detect($('video'), { face: { description: { enabled: withPrint } } });
+  const res = await human.detect($('video'), { face: { description: { enabled: withPrint }, emotion: { enabled: withPrint } } });
   const f = res.face[0];
   const now = performance.now();
   lastFaceBox = f?.box || null;
@@ -431,6 +431,7 @@ async function faceStep() {
   // Who is it? Needs 3 checks in a row to agree before it changes its mind.
   let seen = 'nobody', score = 0;
   if (!withPrint) { drawWho(looking, 0); return; }
+  readExpression(f);
   if (f?.embedding?.length) {
     if (enrolling) enrolling.push(f.embedding.map(v => +v.toFixed(4)));
     if (faceprint) {
@@ -449,7 +450,34 @@ let lastScore = 0;
 function drawWho(looking, score) {
   if (score) lastScore = score;
   const label = who === 'mukta' ? '👤 Mukta' : who === 'someone' ? (faceprint ? '👤 someone else' : '👤 a face') : 'nobody';
-  $('who').textContent = `${label}${who !== 'nobody' && lastScore ? ` (${lastScore.toFixed(2)})` : ''} · ${looking ? 'looking at iPad' : 'looking away'}`;
+  const face = expression && who !== 'nobody' ? ` · ${EXPRESSIONS[expression].emoji} ${EXPRESSIONS[expression].words}` : '';
+  $('who').textContent = `${label}${who !== 'nobody' && lastScore ? ` (${lastScore.toFixed(2)})` : ''} · ${looking ? 'looking at iPad' : 'looking away'}${face}`;
+}
+
+// Expressions: what your face is doing, not what you feel. A smile doesn't always mean happy,
+// so Desk says "you look like you're smiling", never "you're happy".
+const EXPRESSIONS = {
+  happy: { emoji: '🙂', words: 'smiling' },
+  neutral: { emoji: '😐', words: 'neutral face' },
+  surprise: { emoji: '😮', words: 'surprised-looking' },
+  sad: { emoji: '🙁', words: 'down-turned face' },
+  angry: { emoji: '😠', words: 'frowning' },
+  fear: { emoji: '😟', words: 'worried-looking' },
+  disgust: { emoji: '😖', words: 'scrunched-up face' },
+};
+const EXPR_MIN = 0.4;   // ignore guesses the model isn't at least 40% sure about
+let exprHist = [], expression = null;
+function readExpression(f) {
+  const top = [...(f?.emotion || [])].sort((a, b) => b.score - a.score)[0];
+  exprHist.push(top && top.score >= EXPR_MIN && EXPRESSIONS[top.emotion] ? top.emotion : null);
+  if (exprHist.length > 5) exprHist.shift();
+  // Majority of the last 5 reads (about 2 seconds), so one odd frame doesn't flip it.
+  const counts = {};
+  for (const e of exprHist) if (e) counts[e] = (counts[e] || 0) + 1;
+  const [best, n] = Object.entries(counts).sort((a, b) => b[1] - a[1])[0] || [];
+  const next = n >= 3 ? best : expression && counts[expression] ? expression : null;
+  if (next !== expression && next) log(`face looks: ${EXPRESSIONS[next].words}`);
+  expression = next;
 }
 
 function setWho(next) {
@@ -703,11 +731,15 @@ function stopColours() {
 }
 // What the brain is told about the room. Text only, and only while the camera is on.
 function surroundings() {
-  if (!sensors.cam.stream || !seenColours) return '';
+  if (!sensors.cam.stream) return '';
+  const face = expression && who !== 'nobody'
+    ? `\nMukta's facial expression right now looks like: ${EXPRESSIONS[expression].words}. That's only what her face looks like, not how she feels, so don't tell her what she feels. If she asks how she looks, answer in ONE short sentence using only these facts, like "You look like you're smiling." Only mention a colour for her top if a top colour was given above. Otherwise only mention it if it's clearly relevant.`
+    : '';
+  if (!seenColours) return face;
   const list = seenColours.all.map(c => `${c.name} (${c.pct}%)`).join(', ');
   return `\nThe iPad camera is on. The main colours it sees right now are: ${list}.` +
     (seenColours.top ? ` The colour just below Mukta's face, probably her top, is ${seenColours.top.name}.` : '') +
-    ` You can only see colours, nothing else, so don't describe objects or people.`;
+    ` You can only see colours, nothing else. Never make up clothes, objects, people or details you weren't told.` + face;
 }
 
 // ================= Timer =================
@@ -1005,7 +1037,7 @@ function setInputs() {
 
 function systemPrompt() {
   const now = new Date().toLocaleString('en-GB', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric', hour: '2-digit', minute: '2-digit' });
-  return `You are Desk, a helpful assistant for a 13-year-old inventor in the UK. It is now ${now}.
+  return `You are Desk, an AI assistant app on Mukta's iPad (the name is just the app's name: you are not a piece of furniture). Mukta is a 13-year-old inventor in the UK. When she says "I" or "me" she means herself. You are talking TO her, so always call her "you", never "she" or "Mukta". It is now ${now}.
 Answer general-knowledge questions (science, maths, geography, capitals, history, how things work) directly and confidently, in a few sentences. You DO know these.
 Your knowledge stops at the end of 2023 and you have no internet. For news, current leaders, sports results or anything that could have changed since 2023, say plainly that you can't know it.${surroundings()}`;
 }
