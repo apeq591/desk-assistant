@@ -325,7 +325,7 @@ async function handleSpeech(clip, rate) {
   if (!engine) { log('heard something, but the brain is not loaded'); ears('👂 listening (load the brain so I can answer)'); return; }
   log(`voice question: ${text.slice(0, 60)}`);
   // Your words are not shown in the chat, only the answer. They stay in the log.
-  await askBrain(text, false, false);
+  await userAsk(text, false);
   if (sensors.mic.stream) ears('👂 listening');
 }
 
@@ -573,9 +573,37 @@ function onHead(move) {
     else say('Tap Approve to confirm.');
     return;
   }
-  // 3. The brain's last answer was a question: answer it.
-  const lastAi = [...document.querySelectorAll('#chat .ai')].pop()?.textContent || '';
-  if (engine && !busy && /\?\s*$/.test(lastAi)) askBrain(move === 'nod' ? 'Yes.' : 'No.', false, false);
+  if (!engine || busy || !lastAnswer || Date.now() - lastAnswerAt > FEEDBACK_WINDOW_MS) return;
+  // 3. The brain's last answer was a question: nod = yes, shake = no.
+  if (/\?\s*$/.test(lastAnswer)) { askBrain(move === 'nod' ? 'Yes.' : 'No.', false, false); return; }
+  // 4. The brain just told you something: nod = that's right, shake = that's wrong, so ask what was wrong.
+  if (move === 'nod') {
+    feedbackNote = '(Mukta nodded at your last answer, so it was correct.) ';
+    bubble('ai', '👍 Great, glad that was right.');
+    log('you nodded: last answer was right');
+  } else {
+    correctingUntil = Date.now() + CORRECTION_WINDOW_MS;
+    const ask = 'I see you shaking your head. What did I get wrong?';
+    bubble('ai', ask + '  (say it or type it)');
+    say(ask);
+    log('you shook your head: asked what was wrong');
+  }
+}
+
+// Feedback from your head. A nod or shake only counts as feedback for 45 s after an answer.
+const FEEDBACK_WINDOW_MS = 45000, CORRECTION_WINDOW_MS = 90000;
+let lastAnswerAt = 0, feedbackNote = '', correctingUntil = 0;
+
+// Everything you ask (typed or spoken) goes through here, so a correction after a head shake is handled the same way.
+function userAsk(q, showQuestion) {
+  if (Date.now() < correctingUntil) {
+    correctingUntil = 0;
+    log(`correction: ${q.slice(0, 60)}`);
+    return askBrain(`I shook my head at your last answer, so something in it was wrong. My correction: "${q}". Talk to me directly as "you". Thank me in a few words, then give the corrected answer in one or two sentences. If my correction looks wrong to you, say so politely.`,
+      false, showQuestion ? q : false);
+  }
+  const note = feedbackNote; feedbackNote = '';
+  return askBrain(note + q, false, showQuestion ? q : false);
 }
 
 // Wave: the hand swinging side to side. Uses the middle knuckle, which moves more steadily than the fingertips.
@@ -998,7 +1026,7 @@ async function askBrain(q, speak = false, showQuestion = true) {
   if (!engine) { log('brain not loaded, so that action was skipped'); return; }
   if (busy) { log('brain busy, so that action was skipped'); return; }
   busy = true; setInputs();
-  if (showQuestion) bubble('me', q);
+  if (showQuestion) bubble('me', typeof showQuestion === 'string' ? showQuestion : q);   // what you see can differ from what the brain is sent
   turns.push({ role: 'user', content: q });
   const out = bubble('ai', '…');
   let text = '';
@@ -1012,6 +1040,7 @@ async function askBrain(q, speak = false, showQuestion = true) {
     text = clean(text);
     turns.push({ role: 'assistant', content: text });
     lastAnswer = text;
+    lastAnswerAt = Date.now();
     if (speak) say(text);
   } catch (err) {
     turns.pop();
@@ -1057,7 +1086,7 @@ $('form').addEventListener('submit', e => {
   if (no) { refuse(no); return; }
   $('q').value = '';
   log(`asked: ${q.slice(0, 60)}`);
-  askBrain(q);
+  userAsk(q, true);
 });
 
 // Making a rule yourself: you ARE the approver, so no second step. Same menu, same checks.
