@@ -43,6 +43,8 @@
   ul.rules { list-style:none; margin:10px 0 0; padding:0; display:flex; flex-direction:column; gap:6px; }
   ul.rules li { display:flex; justify-content:space-between; align-items:center; gap:8px; padding:8px 10px; background:#0F1115; border-radius:10px; }
   ol#log { font:12px ui-monospace, monospace; color:var(--dim); margin:8px 0 0; padding-left:20px; max-height:200px; overflow:auto; }
+  .swatch { display:inline-flex; align-items:center; gap:6px; padding:4px 10px 4px 4px; border-radius:999px; background:#0F1115; font-size:13px; }
+  .swatch i { width:18px; height:18px; border-radius:50%; border:1px solid var(--line); display:inline-block; }
   .pass { color:var(--ok); } .fail { color:var(--on); }
   @media (max-width:760px) { .layout { grid-template-columns:1fr; } }
 </style>
@@ -63,6 +65,7 @@
         <video id="video" playsinline muted></video>
         <div class="gesture" id="gesture">…</div>
         <div class="gesture" id="motion" style="bottom:auto; top:10px" hidden></div>
+        <div class="state" id="headMeter" style="position:absolute; right:10px; bottom:10px; background:rgba(0,0,0,.6); padding:2px 8px; border-radius:8px"></div>
         <div class="state" id="gap" style="position:absolute; right:10px; top:2px; background:rgba(0,0,0,.6); padding:2px 8px; border-radius:8px"></div>
       </div>
       <div class="bar" id="meter" hidden><i id="level"></i></div>
@@ -76,6 +79,12 @@
         <button class="small" id="forgetFace">Forget my face</button>
       </div>
       <div class="state" id="faceState"></div>
+    </div>
+
+    <div class="card">
+      <h2>What I see</h2>
+      <div class="row" id="colours" style="flex-wrap:wrap; gap:6px; margin-top:8px"><span class="state" style="margin:0">camera off</span></div>
+      <div class="state" id="topColour"></div>
     </div>
 
     <div class="card">
@@ -175,7 +184,7 @@ async function turnOn(key) {
     s.stream = null; render(); return;
   }
   s.stream.getTracks().forEach(t => t.addEventListener('ended', () => { log(`${s.label} track ended by the system`); turnOff(key); }));
-  if (key === 'cam') { $('video').srcObject = s.stream; $('stage').hidden = false; await $('video').play(); startGestures(); startFace(); }
+  if (key === 'cam') { $('video').srcObject = s.stream; $('stage').hidden = false; await $('video').play(); startGestures(); startFace(); startColours(); }
   if (key === 'mic') startMeter(s.stream);
   log(`${s.label} ON`);
   render();
@@ -187,7 +196,7 @@ function turnOff(key) {
   s.stream.getTracks().forEach(t => t.stop());
   const stillLive = liveTracks(s);
   s.stream = null;
-  if (key === 'cam') { stopGestures(); stopFace(); $('video').srcObject = null; $('stage').hidden = true; }
+  if (key === 'cam') { stopGestures(); stopFace(); stopColours(); $('video').srcObject = null; $('stage').hidden = true; }
   if (key === 'mic') stopMeter();
   log(`${s.label} OFF, tracks still live: ${stillLive}`);
   render();
@@ -316,7 +325,7 @@ async function handleSpeech(clip, rate) {
   if (!engine) { log('heard something, but the brain is not loaded'); ears('👂 listening (load the brain so I can answer)'); return; }
   log(`voice question: ${text.slice(0, 60)}`);
   // Your words are not shown in the chat, only the answer. They stay in the log.
-  await askBrain(text, true, false);
+  await askBrain(text, false, false);
   if (sensors.mic.stream) ears('👂 listening');
 }
 
@@ -327,7 +336,7 @@ const FACE_KEY = 'desk.face';
 const MATCH = 0.55;          // similarity above this counts as Mukta (Human's guide: above 0.5 is a match)
 const LOOK_AWAY_MS = 1000;   // head turned away (or gone) this long while Desk is talking = stop talking
 const GREET_GAP_MS = 120000; // don't say hi again within 2 minutes
-let human = null, humanLoading = null, faceTimer = null, faceRun = 0;
+let human = null, humanLoading = null, faceTimer = null, faceRun = 0, faceFrame = 0;
 let faceprint = JSON.parse(localStorage.getItem(FACE_KEY) || 'null');
 let who = 'nobody', whoVotes = [], awaySince = 0, enrolling = null;
 const lastGreet = {};
@@ -360,6 +369,7 @@ async function getHuman() {
       const { Human } = await import(`${HUMAN_URL}/dist/human.esm.js`);
       const h = new Human({
         modelBasePath: `${HUMAN_URL}/models/`, backend: 'webgl', debug: false,
+        cacheSensitivity: 0,   // never reuse an old frame: small head movements matter for nods
         filter: { enabled: false }, gesture: { enabled: false }, body: { enabled: false }, hand: { enabled: false },
         object: { enabled: false }, segmentation: { enabled: false },
         face: { enabled: true, detector: { rotation: true, maxDetected: 1 }, mesh: { enabled: true }, iris: { enabled: false },
@@ -398,14 +408,18 @@ function stopFace() {
 }
 
 async function faceStep() {
-  const res = await human.detect($('video'));
+  // The face fingerprint is the slow part, so it only runs every 4th frame; head movement is read on every frame.
+  faceFrame++;
+  const withPrint = faceFrame % 4 === 0 || !!enrolling;
+  const res = await human.detect($('video'), { face: { description: { enabled: withPrint } } });
   const f = res.face[0];
   const now = performance.now();
+  lastFaceBox = f?.box || null;
 
   // Looking at the iPad? No face, or head turned more than ~30°, counts as away.
   const a = f?.rotation?.angle;
   const looking = !!a && Math.abs(a.yaw) < 0.5 && Math.abs(a.pitch) < 0.45;
-  readHead(a, now);
+  readHead(f, now);
   if (looking) awaySince = 0;
   else if (!awaySince) awaySince = now;
   if (awaySince && now - awaySince > LOOK_AWAY_MS && speechSynthesis.speaking) {
@@ -416,6 +430,7 @@ async function faceStep() {
 
   // Who is it? Needs 3 checks in a row to agree before it changes its mind.
   let seen = 'nobody', score = 0;
+  if (!withPrint) { drawWho(looking, 0); return; }
   if (f?.embedding?.length) {
     if (enrolling) enrolling.push(f.embedding.map(v => +v.toFixed(4)));
     if (faceprint) {
@@ -427,8 +442,14 @@ async function faceStep() {
   if (whoVotes.length > 3) whoVotes.shift();
   if (whoVotes.length === 3 && whoVotes.every(v => v === seen) && seen !== who) setWho(seen);
 
+  drawWho(looking, score);
+}
+
+let lastScore = 0;
+function drawWho(looking, score) {
+  if (score) lastScore = score;
   const label = who === 'mukta' ? '👤 Mukta' : who === 'someone' ? (faceprint ? '👤 someone else' : '👤 a face') : 'nobody';
-  $('who').textContent = `${label}${score ? ` (${score.toFixed(2)})` : ''} · ${looking ? 'looking at iPad' : 'looking away'}`;
+  $('who').textContent = `${label}${who !== 'nobody' && lastScore ? ` (${lastScore.toFixed(2)})` : ''} · ${looking ? 'looking at iPad' : 'looking away'}`;
 }
 
 function setWho(next) {
@@ -495,19 +516,31 @@ function showMotion(text) {
   showMotion.t = setTimeout(() => { $('motion').hidden = true; }, 1500);
 }
 
-// Head: nod = up/down swings, shake = side-to-side swings (angles in radians from the face tracker).
-const MOVE_WINDOW_MS = 1500, HEAD_COOLDOWN_MS = 2000;
+// Head: nod = the nose swinging up and down, shake = side to side.
+// v1 used the tracker's head angles and barely caught real nods on the iPad (too smoothed, too few frames).
+// v2 tracks where the nose tip sits inside the face box, in units of face width, so it's the same close up or far away.
+const MOVE_WINDOW_MS = 1500, HEAD_COOLDOWN_MS = 1500;
+const NOD_RANGE = 0.045, SHAKE_RANGE = 0.07, HEAD_DEAD = 0.012;
 let headHist = [], lastHeadMove = 0, presentSince = 0;
-function readHead(a, now) {
-  if (!a) { headHist = []; return; }
-  headHist.push({ t: now, yaw: a.yaw, pitch: a.pitch });
+function noseOffset(f) {
+  const nose = f?.mesh?.[1], box = f?.box;
+  if (!nose || !box || !box[2]) return null;
+  return { x: (nose[0] - (box[0] + box[2] / 2)) / box[2], y: (nose[1] - (box[1] + box[3] / 2)) / box[2] };
+}
+function readHead(f, now) {
+  const o = noseOffset(f);
+  if (!o) { headHist = []; return; }
+  headHist.push({ t: now, x: o.x, y: o.y });
   headHist = headHist.filter(h => now - h.t < MOVE_WINDOW_MS);
-  if (headHist.length < 6 || now - lastHeadMove < HEAD_COOLDOWN_MS) return;
-  const p = swings(headHist.map(h => h.pitch), 0.04);
-  const y = swings(headHist.map(h => h.yaw), 0.04);
+  if (headHist.length < 5) return;
+  const v = swings(headHist.map(h => h.y), HEAD_DEAD);
+  const h = swings(headHist.map(h => h.x), HEAD_DEAD);
+  $('headMeter').textContent = `nod ${Math.min(99, Math.round(v.range / NOD_RANGE * 100))}% · shake ${Math.min(99, Math.round(h.range / SHAKE_RANGE * 100))}%`;
+  if (now - lastHeadMove < HEAD_COOLDOWN_MS) return;
   let move = null;
-  if (p.turns >= 2 && p.range > 0.12 && p.range > y.range * 1.5) move = 'nod';
-  else if (y.turns >= 2 && y.range > 0.15 && y.range > p.range * 1.5) move = 'shake';
+  // one down-and-up (1 turn) is enough if it's clearly big; smaller movements need to go back and forth twice
+  if (v.range > h.range * 1.3 && ((v.turns >= 2 && v.range > NOD_RANGE) || (v.turns >= 1 && v.range > NOD_RANGE * 1.8))) move = 'nod';
+  else if (h.range > v.range * 1.3 && ((h.turns >= 2 && h.range > SHAKE_RANGE) || (h.turns >= 1 && h.range > SHAKE_RANGE * 1.8))) move = 'shake';
   if (!move) return;
   lastHeadMove = now; headHist = [];
   onHead(move);
@@ -542,7 +575,7 @@ function onHead(move) {
   }
   // 3. The brain's last answer was a question: answer it.
   const lastAi = [...document.querySelectorAll('#chat .ai')].pop()?.textContent || '';
-  if (engine && !busy && /\?\s*$/.test(lastAi)) askBrain(move === 'nod' ? 'Yes.' : 'No.', true, false);
+  if (engine && !busy && /\?\s*$/.test(lastAi)) askBrain(move === 'nod' ? 'Yes.' : 'No.', false, false);
 }
 
 // Wave: the hand swinging side to side. Uses the middle knuckle, which moves more steadily than the fingertips.
@@ -572,6 +605,81 @@ function onWave() {
   const hereFor = presentSince ? Date.now() - presentSince : 0;
   if (hereFor < HI_WINDOW_MS) { say(`Hi${name}!`); log('said hi'); }
   else { say(`Bye${name}! See you soon.`); log('said bye'); }
+}
+
+// ================= Colours: what's around you, from a tiny 64×48 copy of the camera picture =================
+// Only colour names and percentages come out of this; the picture itself is thrown away straight after.
+let lastFaceBox = null, colourTimer = null, seenColours = null;
+const colourCanvas = document.createElement('canvas');
+colourCanvas.width = 64; colourCanvas.height = 48;
+const colourCtx = colourCanvas.getContext('2d', { willReadFrequently: true });
+
+function nameColour(r, g, b) {
+  const max = Math.max(r, g, b) / 255, min = Math.min(r, g, b) / 255, v = max, s = max ? (max - min) / max : 0;
+  if (v < 0.18) return 'black';
+  if (s < 0.15) return v > 0.85 ? 'white' : 'grey';
+  const d = max - min;
+  let h = max === r / 255 ? ((g - b) / 255) / d : max === g / 255 ? 2 + ((b - r) / 255) / d : 4 + ((r - g) / 255) / d;
+  h = (h * 60 + 360) % 360;
+  if (h >= 15 && h < 50 && s < 0.35 && v > 0.6) return 'beige';
+  if (h < 15 || h >= 345) return v < 0.4 ? 'brown' : 'red';
+  if (h < 40) return v < 0.55 ? 'brown' : 'orange';
+  if (h < 65) return v < 0.5 ? 'brown' : 'yellow';
+  if (h < 165) return 'green';
+  if (h < 195) return 'teal';
+  if (h < 255) return 'blue';
+  if (h < 290) return 'purple';
+  return 'pink';
+}
+
+// Counts colour names in a rectangle of the tiny picture. Returns [{ name, pct, rgb }] biggest first.
+function countColours(x0, y0, x1, y1) {
+  const w = Math.max(1, Math.round(x1 - x0)), h = Math.max(1, Math.round(y1 - y0));
+  const px = colourCtx.getImageData(Math.round(x0), Math.round(y0), w, h).data;
+  const tally = {};
+  for (let i = 0; i < px.length; i += 4) {
+    const n = nameColour(px[i], px[i + 1], px[i + 2]);
+    const t = tally[n] || (tally[n] = { n: 0, r: 0, g: 0, b: 0 });
+    t.n++; t.r += px[i]; t.g += px[i + 1]; t.b += px[i + 2];
+  }
+  const total = px.length / 4;
+  return Object.entries(tally).sort((a, b) => b[1].n - a[1].n)
+    .map(([name, t]) => ({ name, pct: Math.round(t.n / total * 100), rgb: `rgb(${t.r / t.n | 0},${t.g / t.n | 0},${t.b / t.n | 0})` }));
+}
+
+function readColours() {
+  const video = $('video');
+  if (!sensors.cam.stream || video.readyState < 2) return;
+  colourCtx.drawImage(video, 0, 0, 64, 48);
+  const all = countColours(0, 0, 64, 48).filter(c => c.pct >= 5).slice(0, 4);
+  // The area just below your face is usually your top.
+  let top = null;
+  if (lastFaceBox && video.videoWidth) {
+    const k = 64 / video.videoWidth, [bx, by, bw, bh] = lastFaceBox.map(v => v * k);
+    const y0 = by + bh * 1.15, y1 = Math.min(48, by + bh * 1.9);
+    if (y1 - y0 >= 2) top = countColours(Math.max(0, bx), y0, Math.min(64, bx + bw), y1)[0] || null;
+  }
+  seenColours = { all, top };
+  $('colours').replaceChildren(...all.map(c => {
+    const el = document.createElement('span'); el.className = 'swatch';
+    el.innerHTML = `<i style="background:${c.rgb}"></i>${c.name} ${c.pct}%`;
+    return el;
+  }));
+  $('topColour').textContent = top ? `Just below your face (probably your top): ${top.name}` : '';
+}
+function startColours() { clearInterval(colourTimer); colourTimer = setInterval(readColours, 2000); setTimeout(readColours, 500); }
+function stopColours() {
+  clearInterval(colourTimer); seenColours = null;
+  $('colours').innerHTML = '<span class="state" style="margin:0">camera off</span>';
+  $('topColour').textContent = '';
+}
+// What the brain is told about the room. Text only, and only while the camera is on.
+function surroundings() {
+  if (!sensors.cam.stream || !seenColours) return '';
+  const list = seenColours.all.map(c => `${c.name} (${c.pct}%)`).join(', ');
+  return `\nThe iPad camera is on. The main colours it sees right now are: ${list}.` +
+    (seenColours.top ? ` The colour just below Mukta's face, probably her top, is ${seenColours.top.name}.` : '') +
+    ` You can only see colours, nothing else, so don't describe objects or people.`;
 }
 
 // ================= Timer =================
@@ -616,8 +724,8 @@ const ACTIONS = {
   timer_5:       { label: 'start a 5-min break timer',  run: () => startTimer(5) },
   timer_1:       { label: 'start a 1-min timer',        run: () => startTimer(1) },
   timer_stop:    { label: 'stop the timer',             run: stopTimer },
-  fun_fact:      { label: 'brain tells a fun fact',     run: () => askBrain('Tell me one surprising fun fact about science or engineering, in two sentences.', true) },
-  motivate:      { label: 'brain says something encouraging', run: () => askBrain('Say one short, genuine line of encouragement for someone about to do focused work. No clichés.', true) },
+  fun_fact:      { label: 'brain tells a fun fact',     run: () => askBrain('Tell me one surprising fun fact about science or engineering, in two sentences.') },
+  motivate:      { label: 'brain says something encouraging', run: () => askBrain('Say one short, genuine line of encouragement for someone about to do focused work. No clichés.') },
   read_aloud:    { label: 'read the last answer aloud', run: readLastAnswer },
   camera_off:    { label: 'turn the camera OFF',        run: () => turnOff('cam') },
   everything_off:{ label: 'turn camera + mic OFF',      run: () => allOff('gesture') },
@@ -871,7 +979,7 @@ function systemPrompt() {
   const now = new Date().toLocaleString('en-GB', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric', hour: '2-digit', minute: '2-digit' });
   return `You are Desk, a helpful assistant for a 13-year-old inventor in the UK. It is now ${now}.
 Answer general-knowledge questions (science, maths, geography, capitals, history, how things work) directly and confidently, in a few sentences. You DO know these.
-Your knowledge stops at the end of 2023 and you have no internet. For news, current leaders, sports results or anything that could have changed since 2023, say plainly that you can't know it.`;
+Your knowledge stops at the end of 2023 and you have no internet. For news, current leaders, sports results or anything that could have changed since 2023, say plainly that you can't know it.${surroundings()}`;
 }
 
 function bubble(cls, text) {
