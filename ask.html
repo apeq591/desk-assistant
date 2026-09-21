@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Desk — step 5½ test</title>
+<!-- Internet is used ONCE: to download the model files. After that, questions and answers never leave the iPad. -->
+<style>
+  :root { --bg:#0A0B0D; --card:#17191E; --line:#262930; --text:#F4F4F2; --dim:#8B8E96; --on:#FF6A2C; --ok:#3DDC84; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:16px/1.4 system-ui, -apple-system, sans-serif;
+         padding:max(20px, env(safe-area-inset-top)) 20px 40px; }
+  main { max-width:760px; }
+  h1 { font-size:22px; margin:0 0 4px; } .sub { color:var(--dim); margin:0 0 20px; font-size:14px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:16px; padding:16px; margin-bottom:14px; }
+  button { padding:14px 18px; font:600 16px system-ui; border-radius:12px; border:2px solid var(--on);
+           background:rgba(255,106,44,.15); color:var(--text); cursor:pointer; }
+  button:disabled { opacity:.4; cursor:default; }
+  .state { margin-top:10px; font:13px ui-monospace, monospace; color:var(--dim); white-space:pre-wrap; }
+  .bar { height:10px; background:#000; border-radius:5px; margin-top:10px; overflow:hidden; }
+  .bar i { display:block; height:100%; width:0; background:var(--on); }
+  #chat { display:flex; flex-direction:column; gap:10px; }
+  .msg { padding:10px 14px; border-radius:12px; max-width:90%; white-space:pre-wrap; }
+  .me { align-self:flex-end; background:rgba(255,106,44,.18); }
+  .ai { align-self:flex-start; background:#0F1115; border:1px solid var(--line); }
+  form { display:flex; gap:8px; margin-top:12px; }
+  input { flex:1; padding:14px; font:16px system-ui; border-radius:12px; border:1px solid var(--line); background:#0F1115; color:var(--text); }
+  .pass { color:var(--ok); } .fail { color:var(--on); }
+</style>
+</head>
+<body>
+<main>
+<h1>Desk assistant: step 5½, the on-iPad brain (test)</h1>
+<p class="sub">A small AI model running on this iPad. Loading it downloads roughly 0.7–0.9 GB once, so do it <b>at home on wifi</b>. After that it's saved and loads much faster.
+Your questions and its answers never leave the iPad.</p>
+
+<div class="card">
+  <button id="load">Load the model</button>
+  <div class="bar"><i id="bar"></i></div>
+  <div class="state" id="status">not loaded</div>
+</div>
+
+<div class="card">
+  <div id="chat"></div>
+  <form id="form">
+    <input id="q" placeholder="Ask something…" autocomplete="off" disabled>
+    <button id="send" disabled>Ask</button>
+  </form>
+  <div class="state" id="speed"></div>
+</div>
+</main>
+
+<script type="module">
+import * as webllm from 'https://cdn.jsdelivr.net/npm/@mlc-ai/web-llm@0.2.85/+esm';
+
+const $ = id => document.getElementById(id);
+// 16-bit version is smaller (~880 MB of GPU memory). If the iPad can't do 16-bit maths, fall back to the 32-bit one (~1130 MB).
+const MODEL_F16 = 'Llama-3.2-1B-Instruct-q4f16_1-MLC';
+const MODEL_F32 = 'Llama-3.2-1B-Instruct-q4f32_1-MLC';
+const SYSTEM = 'You are a desk assistant for a 13-year-old inventor. Answer clearly and briefly. If you are not sure of a fact, say so instead of guessing.';
+
+let engine = null;
+const history = [{ role: 'system', content: SYSTEM }];
+
+function status(text, cls) { $('status').innerHTML = cls ? `<span class="${cls}">${text}</span>` : text; }
+
+function bubble(cls, text) {
+  const d = document.createElement('div');
+  d.className = 'msg ' + cls;
+  d.textContent = text;
+  $('chat').append(d);
+  d.scrollIntoView({ block: 'end' });
+  return d;
+}
+
+$('load').addEventListener('click', async () => {
+  $('load').disabled = true;
+  if (!('gpu' in navigator)) { status('No WebGPU in this browser, so the model cannot run here.', 'fail'); return; }
+  const adapter = await navigator.gpu.requestAdapter();
+  if (!adapter) { status('WebGPU gave no adapter, so the model cannot run here.', 'fail'); return; }
+  const model = adapter.features.has('shader-f16') ? MODEL_F16 : MODEL_F32;
+  status(`loading ${model}…`);
+  const t0 = performance.now();
+  try {
+    engine = await webllm.CreateMLCEngine(model, {
+      initProgressCallback: p => {
+        $('bar').style.width = Math.round(p.progress * 100) + '%';
+        status(p.text);
+      },
+    });
+  } catch (err) {
+    status(`Failed to load: ${err.message}\n\nScreenshot this and send it to ApeQ.`, 'fail');
+    $('load').disabled = false;
+    return;
+  }
+  status(`Ready: ${model}, loaded in ${Math.round((performance.now() - t0) / 1000)} s`, 'pass');
+  $('q').disabled = false; $('send').disabled = false; $('q').focus();
+});
+
+$('form').addEventListener('submit', async e => {
+  e.preventDefault();
+  const q = $('q').value.trim();
+  if (!q || !engine) return;
+  $('q').value = ''; $('q').disabled = true; $('send').disabled = true;
+  bubble('me', q);
+  history.push({ role: 'user', content: q });
+  const out = bubble('ai', '…');
+  const t0 = performance.now();
+  let text = '', tokens = 0;
+  try {
+    const stream = await engine.chat.completions.create({ messages: history, stream: true, temperature: 0.5 });
+    for await (const chunk of stream) {
+      const piece = chunk.choices[0]?.delta?.content || '';
+      text += piece; tokens += piece ? 1 : 0;
+      out.textContent = text;
+    }
+    history.push({ role: 'assistant', content: text });
+    const secs = (performance.now() - t0) / 1000;
+    $('speed').textContent = `about ${(tokens / secs).toFixed(1)} words-ish per second`;
+  } catch (err) {
+    out.textContent = `Error: ${err.message}`;
+    out.classList.add('fail');
+  }
+  $('q').disabled = false; $('send').disabled = false; $('q').focus();
+});
+</script>
+</body>
+</html>
