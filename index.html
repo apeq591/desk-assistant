@@ -101,7 +101,7 @@
     </div>
 
     <div class="card">
-      <button class="go" id="loadBtn">Load the brain + ears</button>
+      <div class="row"><button class="go" id="loadBtn">Load the brain + ears</button><select id="brainPick"></select></div>
       <div class="bar"><i id="loadBar"></i></div>
       <div class="state" id="brainState">not loaded (first time downloads ~0.9 GB, so use wifi)</div>
       <div class="state">It's a small brain: it can state wrong facts confidently. Check anything that matters.</div>
@@ -444,12 +444,12 @@ async function pick(question, request, options) {
   const list = Object.entries(options).map(([k, v]) => `${k} = ${v}`).join('\n');
   const reply = await engine.chat.completions.create({
     messages: [{ role: 'user', content: `${question}\nOptions:\n${list}\nnone = nothing in the list fits\n\nRequest: "${request}"\nReply with JSON only.` }],
-    temperature: 0,
+    temperature: 0, ...extra(),
     response_format: { type: 'json_object', schema: JSON.stringify({
       type: 'object', properties: { choice: { type: 'string', enum: [...Object.keys(options), 'none'] } }, required: ['choice'],
     }) },
   });
-  return JSON.parse(reply.choices[0].message.content).choice;
+  return JSON.parse(clean(reply.choices[0].message.content)).choice;
 }
 
 async function propose(request) {
@@ -565,8 +565,17 @@ function stopGestures() {
 }
 
 // ================= Brain: small model running on the iPad's GPU =================
-const MODEL_F16 = 'Llama-3.2-1B-Instruct-q4f16_1-MLC';
-const MODEL_F32 = 'Llama-3.2-1B-Instruct-q4f32_1-MLC';
+// Brains that fit the iPad. Tested head-to-head on the Mac, 21 Sep: same 7 facts + 3 teach requests each.
+// Bigger ones that are actually smarter (1.5B+) need ~1.6 GB and won't fit next to the ears and eyes.
+const BRAINS = {
+  llama: { name: 'Llama 3.2 1B (Meta), tested on your iPad', f16: 'Llama-3.2-1B-Instruct-q4f16_1-MLC', f32: 'Llama-3.2-1B-Instruct-q4f32_1-MLC' },
+  qwen3: { name: 'Qwen3 0.6B (Alibaba), smaller, better at teaching', f16: 'Qwen3-0.6B-q4f16_1-MLC', f32: 'Qwen3-0.6B-q4f32_1-MLC',
+           opts: { context_window_size: 2048 }, noThink: true },
+};
+let brain = BRAINS[localStorage.getItem('desk.brain')] || BRAINS.llama;
+// Qwen3 can "think out loud" first; that's switched off, and any leftover <think> tags are cut from what you see and hear.
+const extra = () => brain.noThink ? { extra_body: { enable_thinking: false } } : {};
+const clean = t => t.replace(/<think>[\s\S]*?(<\/think>|$)/g, '').replace(/<\/think>/g, '').trim();
 const MAX_TURNS = 6;
 let engine = null;
 let busy = false;
@@ -606,11 +615,12 @@ async function askBrain(q, speak = false, showQuestion = true) {
   let text = '';
   try {
     const messages = [{ role: 'system', content: systemPrompt() }, ...turns.slice(-MAX_TURNS * 2)];
-    const stream = await engine.chat.completions.create({ messages, stream: true, temperature: 0.6 });
+    const stream = await engine.chat.completions.create({ messages, stream: true, temperature: 0.6, ...extra() });
     for await (const chunk of stream) {
       text += chunk.choices[0]?.delta?.content || '';
-      out.textContent = text; $('chat').scrollTop = $('chat').scrollHeight;
+      out.textContent = clean(text) || '…'; $('chat').scrollTop = $('chat').scrollHeight;
     }
+    text = clean(text);
     turns.push({ role: 'assistant', content: text });
     lastAnswer = text;
     if (speak) say(text);
@@ -629,16 +639,19 @@ $('loadBtn').addEventListener('click', async () => {
   await loadEars();
   const adapter = 'gpu' in navigator ? await navigator.gpu.requestAdapter() : null;
   if (!adapter) { $('brainState').innerHTML = '<span class="fail">No WebGPU here, so the brain cannot run.</span>'; return; }
-  const model = adapter.features.has('shader-f16') ? MODEL_F16 : MODEL_F32;
+  brain = BRAINS[$('brainPick').value] || BRAINS.llama;
+  localStorage.setItem('desk.brain', $('brainPick').value);
+  $('brainPick').disabled = true;
+  const model = adapter.features.has('shader-f16') ? brain.f16 : brain.f32;
   const t0 = performance.now();
   try {
     engine = await webllm.CreateMLCEngine(model, {
       initProgressCallback: p => { $('loadBar').style.width = Math.round(p.progress * 100) + '%'; $('brainState').textContent = p.text; },
-    });
+    }, brain.opts);
   } catch (err) {
     $('brainState').innerHTML = `<span class="fail">Failed to load: ${err.message}</span>`;
     log(`brain failed to load: ${err.message}`);
-    $('loadBtn').disabled = false; return;
+    $('loadBtn').disabled = false; $('brainPick').disabled = false; return;
   }
   const secs = Math.round((performance.now() - t0) / 1000);
   $('brainState').innerHTML = `<span class="pass">Brain ready</span> (${model}, ${secs} s)`;
@@ -665,6 +678,9 @@ $('addRule').addEventListener('click', () => {
   rules[g] = a; saveRules();
   log(`rule added by you: ${GESTURES[g]} → ${ACTIONS[a].label}`);
 });
+
+$('brainPick').innerHTML = Object.entries(BRAINS).map(([k, b]) => `<option value="${k}">${b.name}</option>`).join('');
+$('brainPick').value = Object.keys(BRAINS).find(k => BRAINS[k] === brain);
 
 drawLog();
 drawRules();
