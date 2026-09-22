@@ -571,37 +571,57 @@ function maybeCheckIn() {
 }
 
 // Desk says what it sees (fixed words), and the brain only guesses the reason from the conversation.
-const CHECKIN_OPENER = { smiling: 'I see you smiling.', down: 'You look a bit down.', frowning: 'I see you frowning.', worried: 'You look a bit worried.' };
-const CHECKIN_ASK = { smiling: 'What happened?', down: 'Everything OK?', frowning: 'Something annoying you?', worried: 'Want to talk about it?' };
-async function checkIn(expr) {
-  const recent = turns.filter(t => t.role === 'user').slice(-2).map(t => t.content.slice(0, 200)).join('\n');
-  let guess = '';
-  if (recent) {
-    busy = true; setInputs();
-    try {
-      const reply = await engine.chat.completions.create({
-        messages: [{ role: 'user', content:
-`Someone's face just started to look ${EXPRESSIONS[expr].words}. Their last messages were:
-${recent}
-If those messages give an obvious reason, write a yes/no question of at most 8 words guessing it, in the form "Is it about <the thing they mentioned>?".
-If there's no obvious reason, write exactly: NONE` }],
-        temperature: 0.3, max_tokens: 24, ...extra(),
-      });
-      const t = clean(reply.choices[0].message.content).split('\n')[0].replace(/^["']|["']$/g, '').trim();
-      if (/\?$/.test(t) && !/NONE/i.test(t) && t.split(/\s+/).length <= 10) guess = t;
-    } catch (err) {
-      log(`check-in error: ${err.message}`);
-    }
-    busy = false; setInputs();
+const CHECKIN_OPENER = {
+  smiling: ['I see you smiling.', 'That looks like a smile.', 'You look like you\'re smiling.'],
+  down: ['You look a bit down.', 'Your face looks a bit down.', 'That looks like a down-turned face.'],
+  frowning: ['I see you frowning.', 'That looks like a frown.', 'Your eyebrows just came down.'],
+  worried: ['You look a bit worried.', 'Your face looks a bit worried.', 'That looks like a worried face.'],
+};
+const CHECKIN_ASK = {
+  smiling: ['What happened?', 'What\'s the good news?', 'Go on, what is it?', 'Something go well?'],
+  down: ['Everything OK?', 'Want to tell me about it?', 'Rough one?', 'What\'s up?'],
+  frowning: ['Something annoying you?', 'Stuck on something?', 'What\'s bugging you?', 'Is something not working?'],
+  worried: ['Want to talk about it?', 'Something on your mind?', 'What\'s worrying you?', 'Anything I can help with?'],
+};
+// The guess about WHY has to come from her own words, so the brain picks a topic out of her last
+// messages instead of writing one. Left to write freely it guessed "Is it about a diagnosis?" out of nowhere.
+const STOPWORDS = new Set(('i me my we you your it its that this the a an and or but so if then than of to in on at for with from is are was were be been am do does did have has had can could will would should just really very now today yes no not ok okay what when where who why how there here about like get got go going make made' ).split(' '));
+function topicWords() {
+  const said = turns.filter(t => t.role === 'user').slice(-1).map(t => t.content).join(' ');
+  const words = said.replace(/[^\p{L}\p{N}\s'-]/gu, ' ').split(/\s+/).filter(Boolean);
+  const out = [];
+  for (const w of words) {
+    if (w.length < 3 || STOPWORDS.has(w.toLowerCase())) continue;
+    if (!out.some(o => o.toLowerCase() === w.toLowerCase())) out.push(w);
   }
-  const line = `${CHECKIN_OPENER[expr]} ${guess || CHECKIN_ASK[expr]}`;
+  return out.slice(-6);
+}
+async function guessTopic(expr) {
+  const words = topicWords();
+  if (!words.length || !engine) return '';
+  const opts = Object.fromEntries(words.map((w, i) => [String(i + 1), w]));
+  const choice = await pick(`Mukta's face just started to look ${EXPRESSIONS[expr].words}. Here are words she just used. Which one is most likely to be the reason? Pick "none" unless one clearly is.`,
+    turns.filter(t => t.role === 'user').slice(-1).map(t => t.content).join(' '), opts);
+  const n = parseInt(choice, 10);
+  if (!(n >= 1 && n <= words.length)) return '';
+  const w = words[n - 1];
+  return `Is it about ${/^[A-Z]/.test(w) ? w : 'the ' + w}?`;   // "the patent", but "PCA" and "Maths" on their own
+}
+
+async function checkIn(expr) {
+  let guess = '';
+  busy = true; setInputs();
+  try {
+    guess = await guessTopic(expr);
+  } catch (err) {
+    logError(`check-in error: ${err.message}`);
+  }
+  busy = false; setInputs();
+  const opener = await chooseLine(`Her face has just started to look ${EXPRESSIONS[expr].words} and you are saying what you can see.`, CHECKIN_OPENER[expr]);
+  let line = `${opener} ${guess || pickFresh(CHECKIN_ASK[expr])}`;
+  if (saidBefore(line)) line = `${opener} ${pickFresh(CHECKIN_ASK[expr])}`;   // same guess twice in a row is worse than a plain question
   log(`check-in: ${line}`);
-  bubble('ai', line);
-  // Keep it in the conversation so your reply makes sense to the brain.
-  const last = turns[turns.length - 1];
-  if (last?.role === 'assistant') last.content += `\n${line}`;
-  else turns.push({ role: 'assistant', content: line });
-  lastAnswer = line; lastAnswerAt = Date.now();
+  deskSays(line, { motion: false, speak: false });
 }
 
 function setWho(next) {
@@ -612,9 +632,7 @@ function setWho(next) {
   log(`sees: ${next === 'mukta' ? 'Mukta' : faceprint ? 'someone else' : 'a face'}`);
   if (prev === 'nobody' && Date.now() - (lastGreet[next] || 0) > GREET_GAP_MS) {
     lastGreet[next] = Date.now();
-    const hi = next === 'mukta' ? greeting(' Mukta') : 'Hi there! 👋';
-    showMotion(hi, 2500);
-    say(hi.replace(/\s*👋/g, ''));
+    sayHello(next);
   }
 }
 
@@ -733,7 +751,7 @@ function onHead(move) {
   // 4. The brain just told you something: nod = that's right, shake = that's wrong, so ask what was wrong.
   if (move === 'nod') {
     feedbackNote = '(Mukta nodded at your last answer, so it was correct.) ';
-    bubble('ai', '👍 Great, glad that was right.');
+    nodBack();
     log('you nodded: last answer was right');
   } else {
     correctingUntil = Date.now() + CORRECTION_WINDOW_MS;
@@ -742,6 +760,12 @@ function onHead(move) {
     say(ask);
     log('you shook your head: asked what was wrong');
   }
+}
+
+// She nodded, meaning the last answer was right. Say something pleased, and not the same thing every time.
+async function nodBack() {
+  const line = await chooseLine('She just nodded at your last answer, so you got it right.', NOD_POOL);
+  deskSays(`👍 ${line}`, { motion: false });
 }
 
 // Feedback from your head. A nod or shake only counts as feedback for 45 s after an answer.
@@ -782,27 +806,154 @@ function handStill(now) {
   return recent.length < 3 || Math.max(...recent) - Math.min(...recent) < 0.05;
 }
 
-function greeting(name) {
+function partOfDay() {
   const h = new Date().getHours();
-  const part = h < 12 ? 'Good morning' : h < 18 ? 'Good afternoon' : 'Good evening';
-  return [`Hi${name}! 👋`, `Hey${name}! 👋`, `${part}${name}! 👋`][Math.floor(Math.random() * 3)];
+  return h < 12 ? 'morning' : h < 18 ? 'afternoon' : 'evening';
+}
+function greeting(name) {
+  const part = partOfDay();
+  return [`Hi${name}! 👋`, `Hey${name}! 👋`, `Good ${part}${name}! 👋`][Math.floor(Math.random() * 3)];
 }
 function farewell(name) {
   return [`Bye${name}! See you soon. 👋`, `See you later${name}! 👋`, `Bye${name}, have a good one! 👋`][Math.floor(Math.random() * 3)];
 }
-// Says it, shows it big on the video, and writes it in the chat.
-function wave(text) {
-  showMotion(text, 2500);
-  bubble('ai', text);
-  say(text.replace(/\s*👋/g, ''));
+
+// ================= Remarks: Desk's own lines, written fresh instead of copied =================
+// Fixed lines got boring fast, so the brain writes these from what Desk can really see: the time,
+// your face, the colours around you and what you last said. It only ever gets those facts, never a picture.
+// If the brain is busy, missing, or writes something odd, Desk uses a plain line instead, so it can't get stuck.
+const REMARK_MEMORY = 10;
+let saidLines = [], lastSpont = 0;
+const normLine = t => t.toLowerCase().replace(/[^a-z0-9 ]/g, '').replace(/\s+/g, ' ').trim();
+const saidBefore = t => saidLines.some(l => normLine(l) === normLine(t));
+function rememberLine(t) { saidLines.push(t); if (saidLines.length > REMARK_MEMORY) saidLines.shift(); }
+function pickFresh(pool) {
+  const fresh = pool.filter(l => !saidBefore(l));
+  const use = fresh.length ? fresh : pool;
+  return use[Math.floor(Math.random() * use.length)];
 }
-function onWave() {
+
+// The only facts a remark is allowed to use.
+function seenNow() {
+  const bits = [`It is ${partOfDay()}.`];
+  if (expression) bits.push(`Her face looks ${EXPRESSIONS[expression].words} (that is only her face, not how she feels).`);
+  if (seenColours) {
+    if (seenColours.top) bits.push(`The colour just below her face, probably the top she is wearing, is ${seenColours.top.name}.`);
+    if (seenColours.above) bits.push(`The top part of the picture, above her, is mostly ${seenColours.above.name}.`);
+    bits.push(`All the colours the camera sees: ${seenColours.all.map(c => `${c.name} ${c.pct}%`).join(', ')}.`);
+  }
+  const lastUser = turns.filter(t => t.role === 'user').slice(-1)[0];
+  if (lastUser) bits.push(`The last thing she said to you: "${lastUser.content.slice(0, 120)}"`);
+  return bits.join('\n');
+}
+
+// Desk writes the possible lines itself, so every one of them is true. The brain only PICKS which one
+// fits the moment (a 1B brain is far more reliable choosing than writing: left to write, it invented a lamp).
+// Anti-repeat drops lines it has said lately, so the same moment gives a different line next time.
+async function chooseLine(why, pool) {
+  const fresh = pool.filter(l => !saidBefore(l));
+  const cands = (fresh.length ? fresh : pool).slice(0, 8);
+  const any = () => cands[Math.floor(Math.random() * cands.length)];
+  if (cands.length === 1 || !engine || busy || hearing) return any();
+  busy = true; setInputs();
+  try {
+    const opts = Object.fromEntries(cands.map((c, i) => [String(i + 1), c]));
+    const choice = await pick(`${why}\nWhat you can see right now:\n${seenNow()}\nWhich line fits this moment best?`, why, opts);
+    const n = parseInt(choice, 10);
+    if (n >= 1 && n <= cands.length) return cands[n - 1];
+  } catch (err) {
+    logError(`choosing a line failed: ${err.message}`);
+  } finally {
+    busy = false; setInputs();
+  }
+  return any();
+}
+
+// The lines Desk can say. Every one is built from something it actually sees.
+const SKYISH = ['blue', 'white', 'teal', 'green'];
+function greetPool(waved) {
+  const part = partOfDay(), top = seenColours?.top?.name, above = seenColours?.above?.name;
+  const out = [`Hi Mukta! 👋`, `Hey Mukta! 👋`, `Good ${part} Mukta! 👋`, `There you are, Mukta! 👋`];
+  if (waved) out.push(`Hi Mukta, waving back! 👋`, `Hey! 👋 Good ${part}, Mukta.`);
+  if (part === 'morning') out.push(`Morning Mukta! Early start today? 👋`);
+  if (part === 'evening') out.push(`Evening Mukta — still building? 👋`);
+  if (top) out.push(`Hi Mukta! That ${top} looks good on you. 👋`, `Hey Mukta — nice ${top} today. 👋`, `${top.charAt(0).toUpperCase() + top.slice(1)} suits you, Mukta. 👋`);
+  if (above && SKYISH.includes(above)) out.push(`Hi Mukta! I can see a lot of ${above} behind you — are you outside? 👋`, `Hey Mukta — is that a window behind you? 👋`);
+  if (expression === 'smiling') out.push(`Hi Mukta — that looks like a smile. Good ${part}! 👋`);
+  return out;
+}
+function byePool() {
+  const part = partOfDay();
+  return [`Bye Mukta! See you soon. 👋`, `See you later, Mukta! 👋`, `Bye Mukta, have a good ${part}. 👋`,
+    `Catch you later, Mukta! 👋`, `Bye! Come back soon. 👋`, `See you, Mukta — good luck out there. 👋`];
+}
+function noticePool() {
+  const top = seenColours?.top?.name, above = seenColours?.above?.name, out = [];
+  if (top) out.push(`That ${top} looks good on you.`, `Ooh, ${top} today — nice.`, `Is that a ${top} top? It suits you.`);
+  if (above && SKYISH.includes(above)) out.push(`There's a lot of ${above} behind you — are you outside?`, `Is that a window behind you? I can see ${above}.`);
+  if (!out.length) out.push('The colours around you just changed.', 'Something over there changed colour.');
+  return out;
+}
+const NOD_POOL = ['Great, glad that was right.', 'Nice, I got that one.', 'Good — that one landed.',
+  'Glad that helped.', 'Brilliant, thanks for telling me.', 'Good to know I got it right.'];
+
+// Says a line: big on the video, in the chat, out loud, and kept in the conversation.
+function deskSays(line, { motion = true, speak = true } = {}) {
+  rememberLine(line);
+  lastSpont = Date.now();
+  if (motion) showMotion(line, 2500);
+  bubble('ai', line);
+  const last = turns[turns.length - 1];
+  if (last?.role === 'assistant') last.content += `\n${line}`;
+  else turns.push({ role: 'assistant', content: line });
+  if (/\?\s*$/.test(line)) { lastAnswer = line; lastAnswerAt = Date.now(); }   // so a nod or shake can answer it
+  if (speak) say(line.replace(/\s*[\u{1F300}-\u{1FAFF}\u2600-\u27BF]/gu, ''));
+  return line;
+}
+
+// Hello, when your face first shows up.
+async function sayHello(kind) {
+  if (kind !== 'mukta') { deskSays('Hi there! 👋'); log('greeted someone else'); return; }
+  const line = await chooseLine('Mukta has just sat down in front of the camera and you are greeting her.', greetPool(false));
+  deskSays(line);
+  log(`greeted: ${line}`);
+}
+
+// Noticing something, the way a person glances up. Only when a colour actually changes.
+const NOTICE_GAP_MS = 300000, QUIET_MS = 60000;
+let lastNotice = 0, noticeKey = '';
+function maybeNotice() {
+  if (!seenColours || !sensors.cam.stream) return;
+  const key = `${seenColours.top?.name || '-'}|${seenColours.above?.name || '-'}`;
+  const first = !noticeKey;
+  if (key === noticeKey) return;                 // only when something actually changes
+  noticeKey = key;
+  if (first) return;                             // never on the very first reading
+  if (!engine || busy || hearing || talking || pending) return;
+  if (who === 'nobody' || (faceprint && who !== 'mukta')) return;
+  if (awaySince) return;                         // only while you're looking at the iPad
+  if (document.activeElement?.tagName === 'INPUT') return;
+  if (Date.now() - lastNotice < NOTICE_GAP_MS || Date.now() - lastSpont < QUIET_MS) return;
+  lastNotice = Date.now();
+  notice();
+}
+async function notice() {
+  const line = await chooseLine('A colour in view just changed and you are saying something light about it.', noticePool());
+  deskSays(line);
+  log(`noticed: ${line}`);
+}
+async function onWave() {
   log('gesture: 👋 wave');
   const name = who === 'mukta' ? ' Mukta' : '';
   // Hi if you've only just arrived (or there's no face tracker to tell), bye if you've been here a while.
   const hereFor = presentSince ? Date.now() - presentSince : 0;
-  if (hereFor < HI_WINDOW_MS) { wave(greeting(name)); log('waved hi back'); }
-  else { wave(farewell(name)); log('waved bye back'); }
+  const hi = hereFor < HI_WINDOW_MS;
+  const line = who === 'mukta'
+    ? await chooseLine(hi ? 'She just waved hello at the camera and you are waving back.' : 'She just waved goodbye at the camera and you are saying goodbye.',
+        hi ? greetPool(true) : byePool())
+    : (hi ? greeting(name) : farewell(name));
+  deskSays(line);
+  log(hi ? `waved hi back: ${line}` : `waved bye back: ${line}`);
 }
 
 // ================= Colours: what's around you, from a tiny 64×48 copy of the camera picture =================
@@ -857,7 +1008,8 @@ function readColours() {
     const y0 = by + bh * 1.15, y1 = Math.min(48, by + bh * 1.9);
     if (y1 - y0 >= 2) top = countColours(Math.max(0, bx), y0, Math.min(64, bx + bw), y1)[0] || null;
   }
-  seenColours = { all, top };
+  const above = countColours(0, 0, 64, 15).filter(c => c.pct >= 25)[0] || null;
+  seenColours = { all, top, above };
   $('colours').replaceChildren(...all.map(c => {
     const el = document.createElement('span'); el.className = 'swatch';
     el.innerHTML = `<i style="background:${c.rgb}"></i>${c.name} ${c.pct}%`;
@@ -865,7 +1017,7 @@ function readColours() {
   }));
   $('topColour').textContent = top ? `Just below your face (probably your top): ${top.name}` : '';
 }
-function startColours() { clearInterval(colourTimer); colourTimer = setInterval(readColours, 2000); setTimeout(readColours, 500); }
+function startColours() { clearInterval(colourTimer); colourTimer = setInterval(() => { readColours(); maybeNotice(); }, 2000); setTimeout(readColours, 500); }
 function stopColours() {
   clearInterval(colourTimer); seenColours = null;
   $('colours').innerHTML = '<span class="state" style="margin:0">camera off</span>';
