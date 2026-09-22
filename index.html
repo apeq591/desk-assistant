@@ -156,6 +156,12 @@ function log(msg) {
   localStorage.setItem(LOG_KEY, JSON.stringify(logLines));
   drawLog();
 }
+const errAt = {};
+function logError(msg) {
+  if (Date.now() - (errAt[msg] || 0) < 10000) return;
+  errAt[msg] = Date.now();
+  log(msg);
+}
 $('clearLog').addEventListener('click', () => { logLines = []; localStorage.removeItem(LOG_KEY); log('log cleared'); });
 
 // ================= Sensors: one stream each; OFF stops every track so the OS releases the hardware =================
@@ -177,12 +183,25 @@ function render() {
 // Only a tap on the button can switch a sensor ON. Rules and the brain can only ever switch them OFF.
 async function turnOn(key) {
   const s = sensors[key];
+  if (s.starting || s.stream) return;   // a second tap while it's starting would otherwise open a second, untracked stream
+  s.starting = true;
+  let stream;
   try {
-    s.stream = await navigator.mediaDevices.getUserMedia(s.constraints);
+    stream = await navigator.mediaDevices.getUserMedia(s.constraints);
   } catch (err) {
+    s.starting = false;
     log(`${s.label} could not start: ${err.name}: ${err.message}`);
-    s.stream = null; render(); return;
+    render(); return;
   }
+  s.starting = false;
+  // If you left the page (or tapped OFF) while it was starting, release it straight away instead of leaving it running.
+  if (document.hidden || s.cancelled) {
+    s.cancelled = false;
+    stream.getTracks().forEach(t => t.stop());
+    log(`${s.label} start cancelled`);
+    render(); return;
+  }
+  s.stream = stream;
   s.stream.getTracks().forEach(t => t.addEventListener('ended', () => { log(`${s.label} track ended by the system`); turnOff(key); }));
   if (key === 'cam') { $('video').srcObject = s.stream; $('stage').hidden = false; await $('video').play(); startGestures(); startFace(); startColours(); }
   if (key === 'mic') startMeter(s.stream);
@@ -192,6 +211,7 @@ async function turnOn(key) {
 
 function turnOff(key) {
   const s = sensors[key];
+  if (s.starting) s.cancelled = true;
   if (!s.stream) return;
   s.stream.getTracks().forEach(t => t.stop());
   const stillLive = liveTracks(s);
@@ -203,7 +223,7 @@ function turnOff(key) {
 }
 
 for (const key of Object.keys(sensors)) {
-  sensors[key].btn.addEventListener('click', () => sensors[key].stream ? turnOff(key) : turnOn(key));
+  sensors[key].btn.addEventListener('click', () => sensors[key].stream || sensors[key].starting ? turnOff(key) : turnOn(key));
 }
 function allOff(reason) {
   if (sensors.cam.stream || sensors.mic.stream) log(`everything OFF (${reason})`);
@@ -245,7 +265,7 @@ function startMeter(stream) {
     const input = e.inputBuffer.getChannelData(0);
     e.outputBuffer.getChannelData(0).fill(0);
     // Don't listen while Desk is talking or thinking, so it never answers its own voice.
-    if (!transcriber || busy || hearing || speechSynthesis.speaking) { chunks = []; talking = false; return; }
+    if (!transcriber || busy || hearing || deskTalking()) { chunks = []; talking = false; return; }
     let sum = 0;
     for (const v of input) sum += v * v;
     const loud = Math.sqrt(sum / input.length) > VOICE_LEVEL;
@@ -395,7 +415,7 @@ async function startFace() {
   }
   const tick = async () => {
     if (run !== faceRun || !sensors.cam.stream) return;
-    try { await faceStep(); } catch (err) { log(`face error: ${err.message}`); }
+    try { await faceStep(); } catch (err) { logError(`face error: ${err.message}`); }
     faceTimer = setTimeout(tick, 100);   // 10 a second: a nod only lasts about a second
   };
   tick();
@@ -404,6 +424,7 @@ function stopFace() {
   faceRun++;
   clearTimeout(faceTimer);
   who = 'nobody'; whoVotes = []; awaySince = 0; enrolling = null; presentSince = 0; headHist = []; exprHist = []; expression = null;
+  lastScore = 0;
   $('who').textContent = 'camera off';
 }
 
@@ -422,8 +443,8 @@ async function faceStep() {
   readHead(f, now);
   if (looking) awaySince = 0;
   else if (!awaySince) awaySince = now;
-  if (awaySince && now - awaySince > LOOK_AWAY_MS && speechSynthesis.speaking) {
-    speechSynthesis.cancel();
+  if (awaySince && now - awaySince > LOOK_AWAY_MS && deskTalking()) {
+    speechSynthesis.cancel(); talkUntil = 0;
     log('stopped talking: you looked away');
     if (sensors.mic.stream) ears('👂 listening');
   }
@@ -503,9 +524,9 @@ function classifyExpression(sh) {
   const d = k => sh[k] - base[k];
   if (sh.smile > 0.35 || d('smile') > 0.2) return 'smiling';
   if (sh.jaw > 0.35 && (sh.browUp > 0.3 || d('browUp') > 0.2)) return 'surprised';
-  if (d('browDown') > 0.2) return 'frowning';
-  if (d('browUp') > 0.25) return 'worried';
-  if (d('frown') > 0.15) return 'down';
+  if (d('browDown') > 0.14) return 'frowning';
+  if (d('browUp') > 0.2) return 'worried';
+  if (d('frown') > 0.1 || (d('frown') > 0.06 && d('smile') < -0.05)) return 'down';
   return 'neutral';
 }
 
@@ -591,7 +612,9 @@ function setWho(next) {
   log(`sees: ${next === 'mukta' ? 'Mukta' : faceprint ? 'someone else' : 'a face'}`);
   if (prev === 'nobody' && Date.now() - (lastGreet[next] || 0) > GREET_GAP_MS) {
     lastGreet[next] = Date.now();
-    say(next === 'mukta' ? 'Hi Mukta!' : 'Hi there!');
+    const hi = next === 'mukta' ? greeting(' Mukta') : 'Hi there! 👋';
+    showMotion(hi, 2500);
+    say(hi.replace(/\s*👋/g, ''));
   }
 }
 
@@ -641,10 +664,10 @@ function swings(vals, dead) {
   return { turns, range: Math.max(...vals) - Math.min(...vals) };
 }
 
-function showMotion(text) {
+function showMotion(text, ms = 1500) {
   $('motion').textContent = text; $('motion').hidden = false;
   clearTimeout(showMotion.t);
-  showMotion.t = setTimeout(() => { $('motion').hidden = true; }, 1500);
+  showMotion.t = setTimeout(() => { $('motion').hidden = true; }, ms);
 }
 
 // Head: nod = the nose swinging up and down, shake = side to side.
@@ -737,33 +760,49 @@ function userAsk(q, showQuestion) {
   return askBrain(note + q, false, showQuestion ? q : false);
 }
 
-// Wave: the hand swinging side to side. Uses the middle knuckle, which moves more steadily than the fingertips.
-const WAVE_COOLDOWN_MS = 3000, HI_WINDOW_MS = 60000;
+// Wave: the hand swinging side to side. v1 used the middle knuckle and only caught slow waves.
+// v2 averages the knuckle with the middle fingertip (which swings much further when you wave from the wrist),
+// checks 20 times a second instead of 15, and accepts one big swing as well as two smaller ones.
+const WAVE_COOLDOWN_MS = 3000, HI_WINDOW_MS = 60000, WAVE_RANGE = 0.07;
 let handHist = [], lastWave = 0;
 function readHand(result, now) {
   const lm = result.landmarks[0];
   if (!lm) { handHist = []; return; }
-  handHist.push({ t: now, x: lm[9].x, y: lm[9].y });
+  handHist.push({ t: now, x: (lm[9].x + lm[12].x) / 2, y: (lm[9].y + lm[12].y) / 2, kx: lm[9].x });
   handHist = handHist.filter(h => now - h.t < MOVE_WINDOW_MS);
-  if (handHist.length < 8 || now - lastWave < WAVE_COOLDOWN_MS) return;
-  const x = swings(handHist.map(h => h.x), 0.03);
-  const y = swings(handHist.map(h => h.y), 0.03);
-  if (x.turns >= 2 && x.range > 0.08 && x.range > y.range * 1.5) { lastWave = now; handHist = []; onWave(); }
+  if (handHist.length < 6 || now - lastWave < WAVE_COOLDOWN_MS) return;
+  const x = swings(handHist.map(h => h.x), 0.025);
+  const y = swings(handHist.map(h => h.y), 0.025);
+  const wave = x.range > y.range * 1.4 && ((x.turns >= 2 && x.range > WAVE_RANGE) || (x.turns >= 1 && x.range > WAVE_RANGE * 2));
+  if (wave) { lastWave = now; handHist = []; onWave(); }
 }
 // Gesture rules only fire from a still hand, so waving an open palm doesn't set off the open-palm rule.
 function handStill(now) {
-  const recent = handHist.filter(h => now - h.t < 600).map(h => h.x);
+  const recent = handHist.filter(h => now - h.t < 600).map(h => h.kx);
   return recent.length < 3 || Math.max(...recent) - Math.min(...recent) < 0.05;
 }
 
+function greeting(name) {
+  const h = new Date().getHours();
+  const part = h < 12 ? 'Good morning' : h < 18 ? 'Good afternoon' : 'Good evening';
+  return [`Hi${name}! 👋`, `Hey${name}! 👋`, `${part}${name}! 👋`][Math.floor(Math.random() * 3)];
+}
+function farewell(name) {
+  return [`Bye${name}! See you soon. 👋`, `See you later${name}! 👋`, `Bye${name}, have a good one! 👋`][Math.floor(Math.random() * 3)];
+}
+// Says it, shows it big on the video, and writes it in the chat.
+function wave(text) {
+  showMotion(text, 2500);
+  bubble('ai', text);
+  say(text.replace(/\s*👋/g, ''));
+}
 function onWave() {
   log('gesture: 👋 wave');
-  showMotion('👋 wave');
   const name = who === 'mukta' ? ' Mukta' : '';
   // Hi if you've only just arrived (or there's no face tracker to tell), bye if you've been here a while.
   const hereFor = presentSince ? Date.now() - presentSince : 0;
-  if (hereFor < HI_WINDOW_MS) { say(`Hi${name}!`); log('said hi'); }
-  else { say(`Bye${name}! See you soon.`); log('said bye'); }
+  if (hereFor < HI_WINDOW_MS) { wave(greeting(name)); log('waved hi back'); }
+  else { wave(farewell(name)); log('waved bye back'); }
 }
 
 // ================= Colours: what's around you, from a tiny 64×48 copy of the camera picture =================
@@ -872,12 +911,23 @@ function stopTimer() {
   $('timer').textContent = '--:--';
 }
 
+// Is Desk talking? Normally the voice tells us when it finishes, but if it ever gets stuck saying it's still
+// talking, the ears would go deaf for good. So there's also a time limit worked out from the length of the sentence.
+let talkUntil = 0;
+const deskTalking = () => Date.now() < talkUntil;
+
 // Uses the iPad's built-in voices.
 function say(text) {
   if (!('speechSynthesis' in window)) return;
   if (sensors.mic.stream) ears('🔊 talking…');
   speechSynthesis.cancel();
-  speechSynthesis.speak(new SpeechSynthesisUtterance(text));
+  const u = new SpeechSynthesisUtterance(text);
+  talkUntil = Date.now() + 1500 + text.length * 90;
+  clearTimeout(say.t);
+  const done = () => { talkUntil = 0; clearTimeout(say.t); if (sensors.mic.stream) ears(transcriber ? '👂 listening' : ''); };
+  u.onend = u.onerror = done;
+  say.t = setTimeout(done, talkUntil - Date.now());
+  speechSynthesis.speak(u);
 }
 
 // ================= The action menu: the ONLY things a gesture can ever do =================
@@ -1095,8 +1145,17 @@ async function startGestures() {
   const video = $('video');
   const loop = now => {
     if (!sensors.cam.stream) return;
-    if (now - lastFrameAt > 66 && video.readyState >= 2) {
+    if (now - lastFrameAt > 50 && video.readyState >= 2) {
       lastFrameAt = now;
+      try { gestureFrame(video, now); } catch (err) { logError(`eyes error: ${err.message}`); }
+    }
+    gestureRaf = requestAnimationFrame(loop);
+  };
+  gestureRaf = requestAnimationFrame(loop);
+}
+function gestureFrame(video, now) {
+  {
+    {
       const result = recognizer.recognizeForVideo(video, now);
       const name = classify(result);
       readHand(result, now);
@@ -1108,9 +1167,7 @@ async function startGestures() {
       }
       $('gesture').textContent = confirmed ? GESTURES[confirmed] : 'no gesture';
     }
-    gestureRaf = requestAnimationFrame(loop);
-  };
-  gestureRaf = requestAnimationFrame(loop);
+  }
 }
 function stopGestures() {
   cancelAnimationFrame(gestureRaf);
@@ -1144,7 +1201,7 @@ function setInputs() {
 function systemPrompt() {
   const now = new Date().toLocaleString('en-GB', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric', hour: '2-digit', minute: '2-digit' });
   return `You are Desk, an AI assistant app on Mukta's iPad (the name is just the app's name: you are not a piece of furniture). Mukta is a 13-year-old inventor in the UK. When she says "I" or "me" she means herself. You are talking TO her, so always call her "you", never "she" or "Mukta". It is now ${now}.
-Answer general-knowledge questions (science, maths, geography, capitals, history, how things work) directly and confidently, in a few sentences. You DO know these.
+Answer general-knowledge questions (science, maths, geography, capitals, history, how things work) directly and confidently. You DO know these. Keep answers short: 1 to 3 sentences, unless she asks for more detail.
 Your knowledge stops at the end of 2023 and you have no internet. For news, current leaders, sports results or anything that could have changed since 2023, say plainly that you can't know it.${surroundings()}`;
 }
 
@@ -1170,7 +1227,7 @@ async function askBrain(q, speak = false, showQuestion = true) {
   let text = '';
   try {
     const messages = [{ role: 'system', content: systemPrompt() }, ...turns.slice(-MAX_TURNS * 2)];
-    const stream = await engine.chat.completions.create({ messages, stream: true, temperature: 0.6, ...extra() });
+    const stream = await engine.chat.completions.create({ messages, stream: true, temperature: 0.6, max_tokens: 350, ...extra() });
     for await (const chunk of stream) {
       text += chunk.choices[0]?.delta?.content || '';
       out.textContent = clean(text) || '…'; $('chat').scrollTop = $('chat').scrollHeight;
