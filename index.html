@@ -35,6 +35,7 @@
   .msg { padding:10px 14px; border-radius:12px; max-width:90%; white-space:pre-wrap; }
   .me { align-self:flex-end; background:rgba(255,106,44,.18); }
   .ai { align-self:flex-start; background:#0F1115; border:1px solid var(--line); }
+  .src { font-size:12px; padding:4px 10px; } .src a { color:var(--muted, #9aa); } .src.warn a { color:#f5b041; }
   form { display:flex; gap:8px; margin-top:12px; }
   select { padding:8px; font:14px system-ui; border-radius:8px; background:#0F1115; color:var(--text); border:1px solid var(--line); }
   input { flex:1; min-width:0; padding:14px; font:16px system-ui; border-radius:12px; border:1px solid var(--line); background:#0F1115; color:var(--text); }
@@ -129,6 +130,8 @@
       <div class="bar"><i id="loadBar"></i></div>
       <div class="state" id="brainState">not loaded (first time downloads ~0.9 GB, so use wifi)</div>
       <div class="state">It's a small brain: it can state wrong facts confidently. Check anything that matters.</div>
+      <div class="row"><button class="small" id="webBtn">🌐 Wikipedia: OFF</button></div>
+      <div class="state">Off: nothing leaves this iPad. On: for fact questions Desk looks the topic up on Wikipedia only (just the topic words are sent, never your question, name, camera or mic) and shows the source.</div>
       <div id="chat"></div>
       <form id="form">
         <input id="q" placeholder="Ask something…" autocomplete="off" disabled>
@@ -794,6 +797,10 @@ function answerLooks(q, showQuestion) {
 
 function userAsk(q, showQuestion) {
   if (LOOKS_Q.test(q)) { correctingUntil = 0; return answerLooks(q, showQuestion); }
+  const correcting = Date.now() < correctingUntil;
+  const sum = !correcting && calcFrom(q);
+  if (sum) return answerSum(q, sum, showQuestion);
+  if (webOn && !correcting && !feedbackNote) return webAsk(q, showQuestion);
   if (Date.now() < correctingUntil) {
     correctingUntil = 0;
     log(`correction: ${q.slice(0, 60)}`);
@@ -802,6 +809,137 @@ function userAsk(q, showQuestion) {
   }
   const note = feedbackNote; feedbackNote = '';
   return askBrain(note + q, false, showQuestion ? q : false);
+}
+
+// ---------- Calculator ----------
+// Small brains are bad at arithmetic, so plain sums never go to the brain: Desk works them out itself.
+// A tiny parser (numbers, + - * / ^, brackets, sqrt), never eval(), so a typed "sum" can't run code.
+function calcFrom(q) {
+  let t = ' ' + q.toLowerCase().replace(/,(?=\d{3}\b)/g, '') + ' ';
+  t = t.replace(/square root of\s*([\d.]+)/g, 'sqrt($1)').replace(/\bsquared\b/g, '^2').replace(/\bcubed\b/g, '^3')
+       .replace(/\bto the power of\b/g, '^').replace(/\b(times|multiplied by)\b|×|(?<=\d)\s*x\s*(?=\d)/g, '*')
+       .replace(/\bplus\b|\badd\b/g, '+').replace(/\bminus\b|\btake away\b/g, '-').replace(/\bdivided by\b|÷/g, '/');
+  const m = t.match(/(sqrt\(|-?[\d.(])[\d.+\-*/^() sqrt]*[\d)]/);
+  if (!m || !(/\d\s*[+\-*/^]\s*[\d(s]/.test(m[0]) || /sqrt\(/.test(m[0]))) return null;
+  const rest = t.replace(m[0], ' ').replace(/\b(what'?s|what is|whats|calculate|work out|how much is|is|equals?|please|desk|can you|tell me|the)\b|[?=!.]/g, '').trim();
+  if (rest) return null;                           // other words left over, so it's not just a sum: the brain handles it
+  try { const v = evalSum(m[0].replace(/\s+/g, '')); return { expr: m[0].trim(), v: Number.isFinite(v) ? v : null }; }
+  catch { return null; }
+}
+function evalSum(src) {
+  let i = 0;
+  const eat = c => src[i] === c && ++i;
+  const num = () => { const m = src.slice(i).match(/^\d+(\.\d+)?|^\.\d+/); if (!m) throw 0; i += m[0].length; return parseFloat(m[0]); };
+  const atom = () => {
+    if (eat('-')) return -atom();
+    if (src.startsWith('sqrt(', i)) { i += 5; const v = add(); if (!eat(')')) throw 0; return Math.sqrt(v); }
+    if (eat('(')) { const v = add(); if (!eat(')')) throw 0; return v; }
+    return num();
+  };
+  const pow = () => { const b = atom(); return eat('^') ? Math.pow(b, pow()) : b; };
+  const mul = () => { let v = pow(); for (;;) { if (eat('*')) v *= pow(); else if (eat('/')) v /= pow(); else return v; } };
+  const add = () => { let v = mul(); for (;;) { if (eat('+')) v += mul(); else if (eat('-')) v -= mul(); else return v; } };
+  const v = add(); if (i !== src.length) throw 0; return v;
+}
+function answerSum(q, sum, showQuestion) {
+  if (showQuestion) bubble('me', q);
+  const line = sum.v === null ? "That sum doesn't have an answer (you can't divide by zero)."
+    : `🧮 ${sum.expr.replace(/\*/g, '×').replace(/\//g, '÷')} = ${Number(sum.v.toPrecision(12))}`;
+  bubble('ai', line); lastAnswer = line; lastAnswerAt = Date.now();
+  turns.push({ role: 'user', content: q }, { role: 'assistant', content: line });
+  log(`calculator: ${sum.expr}`);
+}
+
+// ---------- Wikipedia lookups ----------
+// Strict on purpose (her rule: no fake clickbait):
+//  - Only en.wikipedia.org, hard-coded. The brain never picks a website, a link or a URL.
+//  - Only the TOPIC is sent, and every topic word must come from her own question, so nothing else can leak.
+//  - Only the plain-text summary is used (no HTML, links or pictures), capped at 1000 characters.
+//  - Disambiguation pages, and pages whose title doesn't match the topic, are thrown away.
+//  - The brain must answer only from that text, and the source is shown under the answer.
+//  - Off on every page load; every lookup is logged.
+let webOn = false;
+const WIKI = 'https://en.wikipedia.org';
+const STOP = new Set('a an the of in on at to for is are was were be what whats who whos when where why how which do does did can could would should will tell me about please desk i my you your it its and or with from by as that this there much many'.split(' '));
+const words = t => t.toLowerCase().match(/[a-z0-9]+/g) || [];
+function updateWeb() {
+  $('webBtn').textContent = `🌐 Wikipedia: ${webOn ? 'ON' : 'OFF'}`;
+  $('webBtn').classList.toggle('on', webOn);
+}
+$('webBtn').addEventListener('click', () => { webOn = !webOn; updateWeb(); log(`Wikipedia lookups ${webOn ? 'ON' : 'OFF'}`); });
+
+// Deciding IF to look something up is done by fixed rules (the 1B brain said "not a fact question" to most facts).
+// The brain only picks which of her own words are the topic, from a list, so it can't invent or add anything.
+const FACT_START = /^\s*(what|what's|whats|who|who's|whos|when|where|which|why|how|is|are|was|were|does|do|did|name|tell me about|explain)\b/i;
+const NOT_WIKI = /\b(i|i'm|im|me|my|mine|myself|you|your|you're|should|today|tonight|now|news|latest|tomorrow|yesterday|weather|score|mukta|desk)\b/i;
+async function findTopic(q) {
+  if (!FACT_START.test(q) || NOT_WIKI.test(q)) return null;
+  const cands = [...new Set(words(q).filter(w => !STOP.has(w) && (w.length > 2 || /\d/.test(w))))].slice(0, 12);
+  if (!cands.length) return null;
+  if (cands.length <= 2) return cands.join(' ');
+  const reply = await engine.chat.completions.create({
+    messages: [{ role: 'user', content: `Question: "${q}"\nWhich 1 to 3 of these words name the thing the question is about (the encyclopedia topic)? Words: ${cands.join(', ')}\nReply with JSON only.` }],
+    temperature: 0, ...extra(),
+    response_format: { type: 'json_object', schema: JSON.stringify({
+      type: 'object', properties: { topic: { type: 'array', items: { type: 'string', enum: cands }, minItems: 1, maxItems: 3 } }, required: ['topic'],
+    }) },
+  });
+  const picked = JSON.parse(clean(reply.choices[0].message.content)).topic;
+  if (!Array.isArray(picked)) return null;
+  const chosen = cands.filter(w => picked.includes(w)).slice(0, 3);     // her word order; only words from her question
+  return chosen.length ? chosen.join(' ') : null;
+}
+
+async function wikiSummary(topic) {
+  const get = async url => { const r = await fetch(url, { credentials: 'omit', referrerPolicy: 'no-referrer' }); if (!r.ok) throw new Error(`Wikipedia said ${r.status}`); return r.json(); };
+  // The page must actually be about the topic: one of the topic words has to be in its title.
+  const matches = t => { const tw = new Set(words(t)); return topic.split(' ').some(w => tw.has(w) || tw.has(w.replace(/s$/, '')) || tw.has(w + 's')); };
+  const found = await get(`${WIKI}/w/api.php?action=query&list=search&srlimit=3&srprop=&format=json&origin=*&srsearch=${encodeURIComponent(topic)}`);
+  const title = (found?.query?.search || []).map(r => r.title).find(t => typeof t === 'string' && matches(t));
+  if (!title) return null;
+  const page = await get(`${WIKI}/api/rest_v1/page/summary/${encodeURIComponent(title.replace(/ /g, '_'))}`);
+  if (page.type !== 'standard' || typeof page.extract !== 'string' || page.extract.length < 40 || !matches(page.title || title)) return null;
+  return { title: String(page.title || title), text: page.extract.replace(/\s+/g, ' ').slice(0, 1000) };
+}
+
+// Did the answer stick to the Wikipedia text? Counts the answer's real words that aren't in the text.
+// Her question's words don't count as backed up: "towards us or away?" let the brain pick "away" (wrong) using only her words.
+// Tested 26 Sep on 6 real answers: both made-up Andromeda answers flagged, 4 correct ones (spider, photosynthesis, Mona Lisa, Canberra) not.
+const stem = w => w.replace(/(ies|es|s|ed|ing|ly)$/, '');
+function unsupported(answer, text) {
+  const known = new Set(words(text).map(stem));
+  const content = words(answer).filter(w => !STOP.has(w) && w.length > 3);
+  const extra = [...new Set(content.filter(w => !known.has(stem(w))))];
+  return extra.length >= 2 && extra.length / Math.max(content.length, 1) >= 0.25 ? extra : null;
+}
+
+async function webAsk(q, showQuestion) {
+  if (!engine || busy) return askBrain(q, false, showQuestion ? q : false);
+  busy = true; setInputs();
+  let src = null;
+  try {
+    const topic = await findTopic(q);
+    if (topic) {
+      log(`Wikipedia lookup: "${topic}"`);
+      src = await wikiSummary(topic);
+      log(src ? `Wikipedia page used: ${src.title}` : 'Wikipedia: no matching page, so no source used');
+    } else log('no Wikipedia lookup (not a fact question)');
+  } catch (err) { log(`Wikipedia lookup failed: ${err.message}`); src = null; }
+  busy = false; setInputs();
+  if (!src) return askBrain(q, false, showQuestion ? q : false);
+  const hidden = `Facts from the Wikipedia page "${src.title}":\n${src.text}\n\nUsing these facts, answer in 1 to 3 sentences: ${q}\n(Stick to these facts. Only if they really don't cover it, say the Wikipedia summary doesn't say.)`;
+  await askBrain(hidden, false, showQuestion ? q : false);
+  // Keep the conversation short: remember the question, not the whole page.
+  const i = turns.map(t => t.content).lastIndexOf(hidden);
+  if (i < 0) return;                                // the brain failed, so there's no answer to cite
+  turns[i] = { role: 'user', content: `${q} (answered from the Wikipedia page "${src.title}")` };
+  const extra = unsupported(turns[turns.length - 1]?.content || '', src.text);
+  const a = document.createElement('a');
+  a.href = `${WIKI}/wiki/${encodeURIComponent(src.title.replace(/ /g, '_'))}`; a.target = '_blank'; a.rel = 'noopener noreferrer';
+  a.textContent = extra ? `⚠️ Careful: parts of this answer aren't in the Wikipedia summary, so the brain may be guessing. Check the page: "${src.title}"`
+                        : `📖 Source: Wikipedia, "${src.title}"`;
+  bubble(extra ? 'ai src warn' : 'ai src', '').append(a);
+  if (extra) log(`answer went beyond Wikipedia (${extra.slice(0, 5).join(', ')}), so it was flagged`);
 }
 
 // Wave: the hand swinging side to side. v1 used the middle knuckle and only caught slow waves.
@@ -1354,6 +1492,8 @@ function stopGestures() {
 const BRAINS = {
   llama: { name: 'Llama 3.2 1B (Meta), tested on your iPad', f16: 'Llama-3.2-1B-Instruct-q4f16_1-MLC', f32: 'Llama-3.2-1B-Instruct-q4f32_1-MLC' },
   qwen3: { name: 'Qwen3 0.6B (Alibaba), smaller, better at teaching', f16: 'Qwen3-0.6B-q4f16_1-MLC', f32: 'Qwen3-0.6B-q4f32_1-MLC',
+           opts: { context_window_size: 2048 }, noThink: true },
+  qwen17: { name: 'Qwen3 1.7B (Alibaba), bigger + smarter, ~2 GB, NEW', f16: 'Qwen3-1.7B-q4f16_1-MLC', f32: 'Qwen3-1.7B-q4f32_1-MLC',
            opts: { context_window_size: 2048 }, noThink: true },
 };
 let brain = BRAINS[localStorage.getItem('desk.brain')] || BRAINS.llama;
