@@ -773,7 +773,27 @@ const FEEDBACK_WINDOW_MS = 45000, CORRECTION_WINDOW_MS = 90000;
 let lastAnswerAt = 0, feedbackNote = '', correctingUntil = 0;
 
 // Everything you ask (typed or spoken) goes through here, so a correction after a head shake is handled the same way.
+// Questions about how she looks never reach the brain. It can't see her (it only gets words like "smiling"
+// and colour names), and on 26 Sep the 1B brain answered "Am I pretty" with "No, you are not pretty."
+// So Desk answers these itself with fixed, true lines.
+const LOOKS_W = '(pretty|ugly|beautiful|gorgeous|cute|hot|attractive|fat|skinny|thin|chubby|overweight|good[- ]looking|nice looking|ugl(y|ier)|prettier)';
+const LOOKS_Q = new RegExp(`\\b(am i|i'?m|i am|do i look|does my|is my|are my|think (that )?(i'?m|i am|me))\\b[^?.!]{0,25}\\b${LOOKS_W}\\b|\\bhow do i look\\b|\\brate (me|my (face|looks|body))\\b`, 'i');
+const LOOKS_LINES = [
+  "I can't actually see what you look like. I only get words like \"smiling\" and colour names. And I don't rate how anyone looks.",
+  "I don't judge looks. I can't really see you anyway, just a couple of words about your face and the colours around you.",
+  "That's not something I rate, for anyone. What I do know is that you built me, which is a lot more interesting.",
+];
+// Backstop in case the brain says something harsh about her anyway.
+const HARSH_A = /\byou('| a)re (not|n't) (pretty|beautiful|cute|smart|clever|good enough)|\byou('| a)re (ugly|fat|stupid|dumb|worthless|annoying)|\byou look (ugly|fat|bad|terrible)/i;
+function answerLooks(q, showQuestion) {
+  if (showQuestion) bubble('me', q);
+  const line = pickFresh(LOOKS_LINES); rememberLine(line);
+  bubble('ai', line); lastAnswer = line;
+  log('looks question: answered by Desk, not the brain');
+}
+
 function userAsk(q, showQuestion) {
+  if (LOOKS_Q.test(q)) { correctingUntil = 0; return answerLooks(q, showQuestion); }
   if (Date.now() < correctingUntil) {
     correctingUntil = 0;
     log(`correction: ${q.slice(0, 60)}`);
@@ -1354,6 +1374,7 @@ function systemPrompt() {
   const now = new Date().toLocaleString('en-GB', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric', hour: '2-digit', minute: '2-digit' });
   return `You are Desk, an AI assistant app on Mukta's iPad (the name is just the app's name: you are not a piece of furniture). Mukta is a 13-year-old inventor in the UK. When she says "I" or "me" she means herself. You are talking TO her, so always call her "you", never "she" or "Mukta". It is now ${now}.
 Answer general-knowledge questions (science, maths, geography, capitals, history, how things work) directly and confidently. You DO know these. Keep answers short: 1 to 3 sentences, unless she asks for more detail.
+Never comment on or rate her looks, face, body or weight, and never say anything unkind about her. You cannot see her.
 Your knowledge stops at the end of 2023 and you have no internet. For news, current leaders, sports results or anything that could have changed since 2023, say plainly that you can't know it.${surroundings()}`;
 }
 
@@ -1385,6 +1406,7 @@ async function askBrain(q, speak = false, showQuestion = true) {
       out.textContent = clean(text) || '…'; $('chat').scrollTop = $('chat').scrollHeight;
     }
     text = clean(text);
+    if (HARSH_A.test(text)) { log('brain said something harsh about you, so it was replaced'); text = pickFresh(LOOKS_LINES); out.textContent = text; }
     turns.push({ role: 'assistant', content: text });
     lastAnswer = text;
     lastAnswerAt = Date.now();
