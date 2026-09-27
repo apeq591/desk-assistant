@@ -823,7 +823,7 @@ const MEM_KEY = 'desk.memory', MEM_MAX = 60;
 let memories = JSON.parse(localStorage.getItem(MEM_KEY) || '[]');
 const VAGUE = /^(it|that|this|them|those|these|you|u|him|her|so|too|lots|a lot|everything|nothing|stuff)$/i;
 function toYou(t) {
-  return t.replace(/\bi am\b/gi, 'you are').replace(/\bi'?m\b/gi, "you're").replace(/\bi'?ve\b/gi, "you've")
+  return t.replace(/\bi was\b/gi, 'you were').replace(/\bi am\b/gi, 'you are').replace(/\bi'?m\b/gi, "you're").replace(/\bi'?ve\b/gi, "you've")
     .replace(/\bmyself\b/gi, 'yourself').replace(/\bmine\b/gi, 'yours').replace(/\bmy\b/gi, 'your')
     .replace(/\bme\b/gi, 'you').replace(/\bi\b/gi, 'you');
 }
@@ -836,10 +836,33 @@ function thing(t) {
 }
 const cap = t => t.charAt(0).toUpperCase() + t.slice(1);
 // Each rule: what she said → a memory in "you" words, plus the curious questions Desk could ask about it.
+const LIKE_ASKS = x => [`What got you into ${x}?`, `What's the best thing about ${x}?`, `When did you first get into ${x}?`, `What do you like most about ${x}?`];
 const MEM_RULES = [
   { re: /\bi (?:really |absolutely |kinda |kind of )?(love|like|enjoy|adore) (.+)/i, kind: 'like',
     make: m => { const x = thing(m[2]); return x && { key: 'like:' + x.toLowerCase(), text: `You ${m[1].toLowerCase()} ${x}`, x }; },
     asks: x => [`What got you into ${x}?`, `What's the best thing about ${x}?`, `When did you first get into ${x}?`, `What do you like most about ${x}?`] },
+  // More ways of saying "I'm into X" (her ask, 27 Sep: "F1 is my thing" should get saved too).
+  { re: /^(?:honestly |tbh |basically |like |ngl )*(.+?) (is|are) (?:literally |basically |honestly )?(?:my|like my) (thing|life|passion|obsession|jam|whole personality|everything|favourite thing|favorite thing|comfort)\b/i, kind: 'like',
+    make: m => { const x = thing(m[1]); return x && { key: 'like:' + x.toLowerCase(), text: `${cap(x)} ${m[2].toLowerCase()} your ${m[3].toLowerCase()}`, x }; },
+    asks: LIKE_ASKS },
+  { re: /\bi(?:'m| am|m) (?:really |so |kinda |kind of |super |lowkey |literally )?(?:into|obsessed with|addicted to|passionate about|hooked on|(?:a )?(?:big |huge |massive )?fan of) (.+)/i, kind: 'like',
+    make: m => { const x = thing(m[1]); return x && { key: 'like:' + x.toLowerCase(), text: `You're into ${x}`, x }; },
+    asks: LIKE_ASKS },
+  { re: /\bi(?:'m| am|m) (?:a )?(?:big |huge |massive |massive |die-?hard )(.+?) fan\b/i, kind: 'like',
+    make: m => { const x = thing(m[1]); return x && { key: 'like:' + x.toLowerCase(), text: `You're a big ${x} fan`, x }; },
+    asks: LIKE_ASKS },
+  { re: /\bi can'?t (?:live|go a day) without (.+)/i, kind: 'like',
+    make: m => { const x = thing(m[1]); return x && { key: 'like:' + x.toLowerCase(), text: `You can't live without ${x}`, x }; },
+    asks: LIKE_ASKS },
+  { re: /^(?:honestly |tbh )*(.+?) (?:is|are) my fav(?:ou?rite)?\b/i, kind: 'fav',
+    make: m => { const x = thing(m[1]); return x && { key: 'fav:' + x.toLowerCase(), text: `${cap(x)} is your favourite`, x }; },
+    asks: x => [`What makes ${x} your favourite?`, `How long has ${x} been your favourite?`] },
+  { re: /\bi(?:'m| am|m) (?:really |pretty |quite |so |actually )?good at (.+)/i, kind: 'skill',
+    make: m => { const x = thing(m[1]); return x && { key: 'skill:' + x.toLowerCase(), text: `You're good at ${x}`, x }; },
+    asks: x => [`How did you get good at ${x}?`, `What's the hardest thing you can do with ${x}?`, `Who taught you ${x}, or did you teach yourself?`] },
+  { re: /\bi (?:play|practise|practice|train|study|take) (.+)/i, kind: 'skill',
+    make: m => { const x = thing(m[1]); return x && !/^(it|with|around|games? with)\b/i.test(x) && { key: 'skill:' + x.toLowerCase(), text: `You ${m[0].match(/\bi (\w+)/i)[1].toLowerCase()} ${x}`, x }; },
+    asks: x => [`How long have you been doing ${x}?`, `What's the best part of ${x}?`, `What made you start ${x}?`] },
   { re: /\bmy fav(?:ou?rite)? ([a-z ]{2,20}?) (?:is|are|would be) (.+)/i, kind: 'fav',
     make: m => { const x = thing(m[2]), what = m[1].trim().toLowerCase(); return x && { key: 'fav:' + what, text: `Your favourite ${what} is ${x}`, x }; },
     asks: x => [`Why ${x}?`, `What makes ${x} your favourite?`, `How long has ${x} been your favourite?`] },
@@ -866,6 +889,8 @@ const ACKS = {
   dislike: () => [`Noted.`, `Fair enough.`, `Got it.`],
   goal: () => [`I love that.`, `Ooh, big plans.`, `Nice.`],
   hero: x => [`${cap(x)} — great pick.`, `Ooh, ${x}.`],
+  skill: x => [`Ooh, ${x}!`, `That's cool.`, `Nice.`],
+  said: () => [`📝 Saved.`, `📝 Got it.`],
   name: () => [`Got it.`, `Cute.`],
 };
 const AGAIN = [`I know — you told me! 😄`, `You told me that before, I remembered. 😄`, `Yep, I've got that one saved.`];
@@ -952,6 +977,77 @@ function answerFollow(q, showQuestion) {
   const line = pickFresh(THANKS);
   deskSays(line, { motion: false, speak: false });
 }
+// Option B (her pick, 27 Sep): for things the rules miss, the brain GUESSES whether she told Desk something about
+// herself, and picks the topic only from her own words. Desk then ASKS before saving anything, so a wrong guess
+// costs one "No", and nothing she didn't say can end up in memory. What's saved is her own sentence, in "you" words.
+const declined = new Set();
+const COMMAND = /^\s*(tell|give|say|make|start|stop|set|show|read|play|turn|open|help|can you|could you|please|let'?s)\b/i;
+function mayBeAboutMe(q) {
+  const n = words(q).length;
+  return n >= 3 && n <= 25 && /\b(i|i'?m|im|i'?ve|my|me|mine)\b/i.test(q) && !COMMAND.test(q)
+    && !(new RegExp(`\\b${LOOKS_W}\\b`, 'i').test(q)) && !declined.has(normLine(q));
+}
+async function guessAboutMe(q) {
+  const seen = new Set(), cands = [];
+  for (const w of q.match(/[A-Za-z0-9][A-Za-z0-9'-]*/g) || []) {
+    const lw = w.toLowerCase();
+    if (!STOP.has(lw) && !seen.has(lw) && !/^(i'?m|im|i'?ve|me|mine|really|so|just|like|very|honestly|literally|always|thing|things|love|stuff)$/.test(lw)) { seen.add(lw); cands.push(w); }
+  }
+  if (!cands.length) return null;
+  const opts = cands.slice(0, 12);
+  // Multiple choice with examples: asked a plain yes/no, the 1B brain said "no" to everything (27 Sep test).
+  const reply = await engine.chat.completions.create({
+    messages: [{ role: 'user', content: `Sort this message from Mukta into one kind.
+hobby = something she loves, does a lot, is good at, or works on (e.g. "I spend hours on chess", "I've been drawing since I was 6", "basketball is everything to me")
+now = how she feels right now, or what just happened today (e.g. "I'm tired", "I just got back", "we had a test")
+other = anything else
+Message: "${q}"
+Then pick the 1 to 3 words from this list that name the hobby or thing: ${opts.join(', ')}
+Reply with JSON only.` }],
+    temperature: 0, ...extra(),
+    response_format: { type: 'json_object', schema: JSON.stringify({
+      type: 'object', properties: { kind: { type: 'string', enum: ['hobby', 'now', 'other'] }, topic: { type: 'array', items: { type: 'string', enum: opts }, minItems: 1, maxItems: 3 } }, required: ['kind', 'topic'],
+    }) },
+  });
+  const r = JSON.parse(clean(reply.choices[0].message.content));
+  log(`memory guess raw: ${JSON.stringify(r).slice(0, 120)}`);
+  if (r.kind !== 'hobby' || !Array.isArray(r.topic)) return null;
+  const topic = opts.filter(w => r.topic.includes(w)).slice(0, 3).join(' ');   // her words, in her order
+  return topic || null;
+}
+async function maybeRemember(q, showQuestion) {
+  if (showQuestion) bubble('me', q);
+  busy = true; setInputs();
+  let topic = null;
+  try { topic = await guessAboutMe(q); } catch (err) { logError(`memory guess failed: ${err.message}`); }
+  busy = false; setInputs();
+  if (!topic) return askBrain(q, false, false);
+  turns.push({ role: 'user', content: q });
+  const ask = `Sounds like ${topic} matters to you. Want me to remember that?`;
+  const d = bubble('ai', ask);
+  const row = document.createElement('div'); row.className = 'row'; row.style.marginTop = '8px';
+  const yes = document.createElement('button'), no = document.createElement('button');
+  yes.className = 'small go'; yes.textContent = 'Yes, remember'; no.className = 'small'; no.textContent = 'No';
+  row.append(yes, no); d.append(row);
+  turns.push({ role: 'assistant', content: ask });
+  log(`memory guess: "${topic}", asked before saving`);
+  const done = () => row.remove();
+  yes.addEventListener('click', async () => {
+    const why = blockedReason('memory yes'); if (why) { refuse(why); return; }
+    done();
+    const text = cap(toYou(q.replace(/[.!]+$/, '').trim()).slice(0, 80));
+    store({ key: 'said:' + normLine(text), text, x: topic }, { kind: 'said' });
+    const line = await chooseLine(`Mukta told you: "${q}". You are curious and want to ask her ONE follow-up question about ${topic}.`, LIKE_ASKS(topic));
+    following = { question: line, until: Date.now() + FOLLOW_MS };
+    deskSays(`📝 Saved. ${line}`, { motion: false, speak: false });
+  });
+  no.addEventListener('click', () => {
+    done(); declined.add(normLine(q));
+    deskSays(pickFresh([`No problem, I won't.`, `Okay, not saved.`]), { motion: false, speak: false });
+    log('memory guess: she said no');
+  });
+}
+
 const RECALL_Q = /\bwhat (?:do you|d'?you) (?:know|remember) about me\b|\bwhat have i told you\b|\bwhat do you remember\b/i;
 function answerRecall(q, showQuestion) {
   if (showQuestion) bubble('me', q);
@@ -976,6 +1072,9 @@ function userAsk(q, showQuestion) {
   following = null;
   if (got && !question) return curious(q, got, showQuestion);   // telling Desk something: it asks about it
   // A question that also told Desk something (e.g. "I love F1, who won in 2021?") is saved quietly and answered normally.
+  // Only with the Qwen3 1.7B brain: tested 27 Sep, Llama 1B said "no" to everything, then (with examples) "yes" to
+  // everything. Qwen3 1.7B got 2/2 hobbies right and asked about 1 of 4 non-hobbies (homework).
+  if (!got && !question && !correcting && !feedbackNote && engine && !busy && brain === BRAINS.qwen17 && mayBeAboutMe(q)) return maybeRemember(q, showQuestion);
   const sum = !correcting && calcFrom(q);
   if (sum) return answerSum(q, sum, showQuestion);
   if (webOn && !correcting && !feedbackNote) return webAsk(q, showQuestion);
@@ -1222,7 +1321,7 @@ function greetPool(waved) {
 const memoryHello = new Set();
 // Bringing back something she told Desk, the way a friend would ("How's MediQ going?").
 function memoryHellos() {
-  const pool = memories.filter(m => ['like', 'work', 'goal', 'fav'].includes(m.kind)).slice(-8);
+  const pool = memories.filter(m => ['like', 'work', 'goal', 'fav', 'skill'].includes(m.kind)).slice(-8);
   if (!pool.length) return [];
   const m = pool[Math.floor(Math.random() * pool.length)];
   const lines = {
@@ -1230,6 +1329,7 @@ function memoryHellos() {
     fav: [`Hi Mukta! Still loving ${m.x}? 👋`],
     work: [`Hi Mukta! How's ${m.x} going? 👋`, `Hey Mukta! Any progress on ${m.x}? 👋`],
     goal: [`Hi Mukta! Any closer to your plan to ${m.x}? 👋`],
+    skill: [`Hi Mukta! Done any ${m.x} lately? 👋`],
   }[m.kind];
   const line = lines[Math.floor(Math.random() * lines.length)];
   memoryHello.add(line);
