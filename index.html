@@ -795,8 +795,22 @@ function answerLooks(q, showQuestion) {
   log('looks question: answered by Desk, not the brain');
 }
 
+// Questions about her own name never reach the brain either. On 26 Sep it answered "What does my name mean" with
+// "I don't know what your name is, Mukta", and made up part of what "Mukta" means. So Desk answers with fixed, true lines.
+const NAME_Q = /\b(what'?s|what is|whats|say|tell me|do you know) my name\b|\bwho am i\b/i;
+const NAME_MEANING_Q = /\b(my name|the name mukta|the word mukta|mukta)\b[^?.!]{0,20}\b(mean|meaning|come from|origin)|\b(meaning|origin) of (my name|the name mukta|the word mukta|mukta)\b/i;
+const NAME_MEANING = "Mukta (मुक्ता) comes from Sanskrit. It means \"pearl\". It's also linked to \"mukti\", which means freedom or liberation.";
+function answerName(q, showQuestion) {
+  if (showQuestion) bubble('me', q);
+  const line = NAME_MEANING_Q.test(q) ? NAME_MEANING : 'Your name is Mukta.';
+  bubble('ai', line); lastAnswer = line; lastAnswerAt = Date.now();
+  turns.push({ role: 'user', content: q }, { role: 'assistant', content: line });
+  log('name question: answered by Desk, not the brain');
+}
+
 function userAsk(q, showQuestion) {
   if (LOOKS_Q.test(q)) { correctingUntil = 0; return answerLooks(q, showQuestion); }
+  if (NAME_Q.test(q) || NAME_MEANING_Q.test(q)) { correctingUntil = 0; return answerName(q, showQuestion); }
   const correcting = Date.now() < correctingUntil;
   const sum = !correcting && calcFrom(q);
   if (sum) return answerSum(q, sum, showQuestion);
@@ -1512,7 +1526,7 @@ function setInputs() {
 
 function systemPrompt() {
   const now = new Date().toLocaleString('en-GB', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric', hour: '2-digit', minute: '2-digit' });
-  return `You are Desk, an AI assistant app on Mukta's iPad (the name is just the app's name: you are not a piece of furniture). Mukta is a 13-year-old inventor in the UK. When she says "I" or "me" she means herself. You are talking TO her, so always call her "you", never "she" or "Mukta". It is now ${now}.
+  return `You are Desk, an AI assistant app on Mukta's iPad (the name is just the app's name: you are not a piece of furniture). Mukta is a 13-year-old inventor in the UK. Her name is Mukta, so if she asks her name, it is Mukta. When she says "I" or "me" she means herself. You are talking TO her, so always call her "you", never "she" or "Mukta". It is now ${now}.
 Answer general-knowledge questions (science, maths, geography, capitals, history, how things work) directly and confidently. You DO know these. Keep answers short: 1 to 3 sentences, unless she asks for more detail.
 Never comment on or rate her looks, face, body or weight, and never say anything unkind about her. You cannot see her.
 Your knowledge stops at the end of 2023 and you have no internet. For news, current leaders, sports results or anything that could have changed since 2023, say plainly that you can't know it.${surroundings()}`;
