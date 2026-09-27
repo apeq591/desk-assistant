@@ -83,6 +83,12 @@
     </div>
 
     <div class="card">
+      <div class="row" style="justify-content:space-between"><h2>What I remember about you</h2><button class="small" id="forgetAll">Forget all</button></div>
+      <div class="state">saved on this iPad only · tell me things like "I love F1", "I'm working on MediQ", or "remember that …"</div>
+      <ul class="rules" id="memList"></ul>
+    </div>
+
+    <div class="card">
       <h2>What I see</h2>
       <div class="row" id="colours" style="flex-wrap:wrap; gap:6px; margin-top:8px"><span class="state" style="margin:0">camera off</span></div>
       <div class="state" id="topColour"></div>
@@ -808,10 +814,168 @@ function answerName(q, showQuestion) {
   log('name question: answered by Desk, not the brain');
 }
 
+// ================= Memory: things you tell Desk about yourself =================
+// Her ask (27 Sep): remember stuff about me, and ask curious questions like it cares.
+// Saving is done by fixed rules, never by the brain: a 1B brain would "remember" things she never said.
+// The questions Desk asks are built from her own words and the brain only PICKS one (same trick as greetings).
+// Everything stays in localStorage on this iPad. Memories only ever go to the on-device brain.
+const MEM_KEY = 'desk.memory', MEM_MAX = 60;
+let memories = JSON.parse(localStorage.getItem(MEM_KEY) || '[]');
+const VAGUE = /^(it|that|this|them|those|these|you|u|him|her|so|too|lots|a lot|everything|nothing|stuff)$/i;
+function toYou(t) {
+  return t.replace(/\bi am\b/gi, 'you are').replace(/\bi'?m\b/gi, "you're").replace(/\bi'?ve\b/gi, "you've")
+    .replace(/\bmyself\b/gi, 'yourself').replace(/\bmine\b/gi, 'yours').replace(/\bmy\b/gi, 'your')
+    .replace(/\bme\b/gi, 'you').replace(/\bi\b/gi, 'you');
+}
+// The thing she's talking about: stops at the first comma/full stop/"but"/"because", max 50 characters.
+function thing(t) {
+  const x = toYou(t.split(/[,.!;]|\s(?:but|because|cos|cuz|and then)\s/i)[0].trim()).replace(/\s+/g, ' ');
+  // Nothing about how she looks gets saved ("I like my hair" is fine, "I'm fat" isn't; "hot chocolate" is fine too).
+  if (!x || x.length > 50 || VAGUE.test(x) || (/\byou(r|'re)?\b/i.test(x) && new RegExp(`\\b${LOOKS_W}\\b`, 'i').test(x))) return '';
+  return x;
+}
+const cap = t => t.charAt(0).toUpperCase() + t.slice(1);
+// Each rule: what she said → a memory in "you" words, plus the curious questions Desk could ask about it.
+const MEM_RULES = [
+  { re: /\bi (?:really |absolutely |kinda |kind of )?(love|like|enjoy|adore) (.+)/i, kind: 'like',
+    make: m => { const x = thing(m[2]); return x && { key: 'like:' + x.toLowerCase(), text: `You ${m[1].toLowerCase()} ${x}`, x }; },
+    asks: x => [`What got you into ${x}?`, `What's the best thing about ${x}?`, `When did you first get into ${x}?`, `What do you like most about ${x}?`] },
+  { re: /\bmy fav(?:ou?rite)? ([a-z ]{2,20}?) (?:is|are|would be) (.+)/i, kind: 'fav',
+    make: m => { const x = thing(m[2]), what = m[1].trim().toLowerCase(); return x && { key: 'fav:' + what, text: `Your favourite ${what} is ${x}`, x }; },
+    asks: x => [`Why ${x}?`, `What makes ${x} your favourite?`, `How long has ${x} been your favourite?`] },
+  { re: /\bi(?:'m| am) (?:currently |still )?(working on|building|making|learning|designing|coding|writing) (.+)/i, kind: 'work',
+    make: m => { const x = thing(m[2]); return x && { key: 'work:' + x.toLowerCase(), text: `You're ${m[1].toLowerCase()} ${x}`, x }; },
+    asks: x => [`Ooh, how's ${x} going?`, `What's the hardest part of ${x} so far?`, `What made you start ${x}?`, `What's the next step for ${x}?`] },
+  { re: /\bi (?:really )?(?:hate|don'?t like|do not like|can'?t stand) (.+)/i, kind: 'dislike',
+    make: m => { const x = thing(m[1]); return x && { key: 'dislike:' + x.toLowerCase(), text: `You don't like ${x}`, x }; },
+    asks: x => [`Fair. What is it about ${x} that you don't like?`, `What don't you like about ${x}?`] },
+  { re: /\bi (?:want|wanna|would love|hope) to (.+)/i, kind: 'goal',
+    make: m => { const x = thing(m[1]); return x && !/^(know|ask|see|check|find out|hear|talk|say|sleep|eat|go to (bed|sleep)|stop|try this)\b/i.test(x) && { key: 'goal:' + x.toLowerCase(), text: `You want to ${x}`, x }; },
+    asks: x => [`What made you want to ${x}?`, `What would the first step be?`, `Ooh. When did you decide you want to ${x}?`] },
+  { re: /\b(?:i look up to|my (?:hero|inspiration|role model|idol) is) (.+)/i, kind: 'hero',
+    make: m => { const x = thing(m[1]); return x && { key: 'hero:' + x.toLowerCase(), text: `You look up to ${x}`, x }; },
+    asks: x => [`What is it about ${x} that you look up to?`, `When did you start looking up to ${x}?`] },
+  { re: /\bmy ([a-z ]{2,20}?)(?:'s| is) called (.+)/i, kind: 'name',
+    make: m => { const x = thing(m[2]), what = toYou(m[1].trim().toLowerCase()); return x && { key: 'name:' + what, text: `Your ${what} is called ${x}`, x }; },
+    asks: x => [`${cap(x)} — nice name! How did you choose it?`] },
+];
+const ACKS = {
+  like: x => [`Ooh, ${x}!`, `Nice, ${x}.`, `${cap(x)} — good choice.`],
+  fav: x => [`${cap(x)}, nice.`, `Ooh, ${x}.`, `Good pick.`],
+  work: x => [`Ooh, ${x}.`, `That sounds cool.`, `Nice.`],
+  dislike: () => [`Noted.`, `Fair enough.`, `Got it.`],
+  goal: () => [`I love that.`, `Ooh, big plans.`, `Nice.`],
+  hero: x => [`${cap(x)} — great pick.`, `Ooh, ${x}.`],
+  name: () => [`Got it.`, `Cute.`],
+};
+const AGAIN = [`I know — you told me! 😄`, `You told me that before, I remembered. 😄`, `Yep, I've got that one saved.`];
+const THANKS = [`Love that. 📝 I'll remember it.`, `That makes sense. 📝 Saved.`, `Ooh, interesting. 📝 I'll remember that.`, `Got it. 📝 Remembered.`];
+
+function saveMemories() { localStorage.setItem(MEM_KEY, JSON.stringify(memories)); drawMemories(); }
+function drawMemories() {
+  const ul = $('memList'); ul.innerHTML = '';
+  if (!memories.length) { const li = document.createElement('li'); li.innerHTML = '<span class="state" style="margin:0">nothing yet</span>'; ul.append(li); return; }
+  for (const m of [...memories].reverse()) {
+    const li = document.createElement('li'), span = document.createElement('span'), del = document.createElement('button');
+    span.textContent = m.text; del.className = 'small'; del.textContent = 'Forget';
+    del.addEventListener('click', () => { memories = memories.filter(x => x.key !== m.key); saveMemories(); log(`forgot: ${m.text}`); });
+    li.append(span, del); ul.append(li);
+  }
+}
+$('forgetAll').addEventListener('click', () => { memories = []; saveMemories(); log('forgot everything'); });
+drawMemories();
+
+// Returns { mem, rule, isNew } if what she said is something to remember, else null.
+function remember(q) {
+  let s = q.trim().replace(/^(?:hey |ok |so |well |also |and )?(?:desk,? )?/i, '');
+  const explicit = s.match(/^(?:please )?remember (?:that )?(.+)/i);
+  if (explicit) s = explicit[1];
+  for (const rule of MEM_RULES) {
+    const m = s.match(rule.re);
+    const mem = m && rule.make(m);
+    if (mem) return store(mem, rule);
+  }
+  if (explicit) {
+    const x = toYou(explicit[1].replace(/[.!]+$/, '').trim());
+    if (x.length >= 3 && x.length <= 80 && !LOOKS_Q.test(explicit[1])) return store({ key: 'note:' + x.toLowerCase(), text: cap(x), x }, null);
+  }
+  return null;
+}
+function store(mem, rule) {
+  const i = memories.findIndex(m => m.key === mem.key);
+  const isNew = i < 0 || memories[i].text !== mem.text;
+  if (i >= 0) memories.splice(i, 1);
+  memories.push({ key: mem.key, text: mem.text, kind: rule?.kind || 'note', x: mem.x, at: Date.now() });
+  if (memories.length > MEM_MAX) memories.shift();
+  saveMemories();
+  log(isNew ? `remembered: ${mem.text}` : `already knew: ${mem.text}`);
+  return { mem, rule, isNew };
+}
+
+// For the brain: what she's told Desk, so it can bring things up naturally.
+function aboutHer() {
+  if (!memories.length) return '';
+  return `\nThings Mukta has told you about herself (use them naturally when they're relevant, don't list them, don't add to them):\n` +
+    memories.slice(-15).map(m => {
+      if (m.key.startsWith('ans:')) { const [ask, ans] = m.text.split(' → '); return `- When you asked "${ask}?", she said: "${ans}"`; }
+      return `- ${m.text.replace(/^You're\b/, 'She is').replace(/^Your\b/, 'Her').replace(/^You\b/, 'She')}`;
+    }).join('\n');
+}
+
+// After Desk asks a curious question, her next answer (if it isn't a question) is saved with it.
+const FOLLOW_MS = 120000;
+let following = null;   // { question, until }
+async function curious(q, got, showQuestion) {
+  if (showQuestion) bubble('me', q);
+  turns.push({ role: 'user', content: q });
+  const { mem, rule, isNew } = got;
+  let line;
+  if (!rule) line = `📝 Got it, I'll remember that: ${mem.text.charAt(0).toLowerCase() + mem.text.slice(1)}.`;
+  else {
+    const ack = isNew ? pickFresh(ACKS[rule.kind](mem.x)) : pickFresh(AGAIN);
+    const ask = await chooseLine(`Mukta just told you: "${q}". You are curious and want to ask her ONE follow-up question about it.`, rule.asks(mem.x));
+    line = `${ack} ${ask}`;
+    following = { question: ask, until: Date.now() + FOLLOW_MS };
+  }
+  deskSays(line, { motion: false, speak: false });
+  log(`curious: ${line}`);
+}
+function answerFollow(q, showQuestion) {
+  const f = following; following = null;
+  if (showQuestion) bubble('me', q);
+  turns.push({ role: 'user', content: q });
+  if (/^(idk|i don'?t know|dunno|no|nah|nothing|not sure|never ?mind|nvm|skip)\b/i.test(q.trim())) {
+    deskSays(pickFresh([`No worries!`, `That's okay!`, `Fair enough.`]), { motion: false, speak: false }); return;
+  }
+  const reply = toYou(q.replace(/[.!]+$/, '').trim()).slice(0, 80);
+  store({ key: 'ans:' + f.question.toLowerCase(), text: `${f.question.replace(/\?$/, '').replace(/^(?:Ooh|Fair)[.,]\s*/i, '')} → ${reply}`, x: reply }, null);
+  const line = pickFresh(THANKS);
+  deskSays(line, { motion: false, speak: false });
+}
+const RECALL_Q = /\bwhat (?:do you|d'?you) (?:know|remember) about me\b|\bwhat have i told you\b|\bwhat do you remember\b/i;
+function answerRecall(q, showQuestion) {
+  if (showQuestion) bubble('me', q);
+  const line = memories.length
+    ? `Here's what you've told me:\n${memories.slice(-10).map(m => `• ${m.text}`).join('\n')}`
+    : `Nothing yet! Tell me about yourself — what are you into?`;
+  bubble('ai', line); lastAnswer = line; lastAnswerAt = Date.now();
+  turns.push({ role: 'user', content: q }, { role: 'assistant', content: 'I listed what she has told me.' });
+  log('recall: listed memories');
+}
+
 function userAsk(q, showQuestion) {
   if (LOOKS_Q.test(q)) { correctingUntil = 0; return answerLooks(q, showQuestion); }
   if (NAME_Q.test(q) || NAME_MEANING_Q.test(q)) { correctingUntil = 0; return answerName(q, showQuestion); }
+  if (RECALL_Q.test(q)) { following = null; return answerRecall(q, showQuestion); }
   const correcting = Date.now() < correctingUntil;
+  const question = /\?\s*$/.test(q) || FACT_START.test(q);
+  // Only a "?" counts here: an answer like "When I was 8" starts like a question but isn't one.
+  // Something new to remember wins over "answering" the last question ("I'm working on MediQ" isn't an answer to "What got you into F1?").
+  const got = !correcting && remember(q);
+  if (!got && !correcting && following && Date.now() < following.until && !/\?\s*$/.test(q)) return answerFollow(q, showQuestion);
+  following = null;
+  if (got && !question) return curious(q, got, showQuestion);   // telling Desk something: it asks about it
+  // A question that also told Desk something (e.g. "I love F1, who won in 2021?") is saved quietly and answered normally.
   const sum = !correcting && calcFrom(q);
   if (sum) return answerSum(q, sum, showQuestion);
   if (webOn && !correcting && !feedbackNote) return webAsk(q, showQuestion);
@@ -1052,7 +1216,24 @@ function greetPool(waved) {
   if (top) out.push(`Hi Mukta! That ${top} looks good on you. 👋`, `Hey Mukta — nice ${top} today. 👋`, `${top.charAt(0).toUpperCase() + top.slice(1)} suits you, Mukta. 👋`);
   if (above && SKYISH.includes(above)) out.push(`Hi Mukta! I can see a lot of ${above} behind you — are you outside? 👋`, `Hey Mukta — is that a window behind you? 👋`);
   if (expression === 'smiling') out.push(`Hi Mukta — that looks like a smile. Good ${part}! 👋`);
+  if (!waved) out.push(...memoryHellos());
   return out;
+}
+const memoryHello = new Set();
+// Bringing back something she told Desk, the way a friend would ("How's MediQ going?").
+function memoryHellos() {
+  const pool = memories.filter(m => ['like', 'work', 'goal', 'fav'].includes(m.kind)).slice(-8);
+  if (!pool.length) return [];
+  const m = pool[Math.floor(Math.random() * pool.length)];
+  const lines = {
+    like: [`Hi Mukta! Been doing much ${m.x} lately? 👋`, `Hey Mukta! Anything new with ${m.x}? 👋`],
+    fav: [`Hi Mukta! Still loving ${m.x}? 👋`],
+    work: [`Hi Mukta! How's ${m.x} going? 👋`, `Hey Mukta! Any progress on ${m.x}? 👋`],
+    goal: [`Hi Mukta! Any closer to your plan to ${m.x}? 👋`],
+  }[m.kind];
+  const line = lines[Math.floor(Math.random() * lines.length)];
+  memoryHello.add(line);
+  return [line, line];   // twice, so a memory line gets picked more often than any single colour line
 }
 function byePool() {
   const part = partOfDay();
@@ -1088,6 +1269,8 @@ async function sayHello(kind) {
   if (kind !== 'mukta') { deskSays('Hi there! 👋'); log('greeted someone else'); return; }
   const line = await chooseLine('Mukta has just sat down in front of the camera and you are greeting her.', greetPool(false));
   deskSays(line);
+  // A "How's MediQ going?" hello: her answer gets remembered, same as any curious question.
+  if (memoryHello.has(line)) following = { question: line.replace(/^(Hi|Hey) Mukta! /, '').replace(/\s*👋$/, ''), until: Date.now() + FOLLOW_MS };
   log(`greeted: ${line}`);
 }
 
@@ -1529,7 +1712,7 @@ function systemPrompt() {
   return `You are Desk, an AI assistant app on Mukta's iPad (the name is just the app's name: you are not a piece of furniture). Mukta is a 13-year-old inventor in the UK. Her name is Mukta, so if she asks her name, it is Mukta. When she says "I" or "me" she means herself. You are talking TO her, so always call her "you", never "she" or "Mukta". It is now ${now}.
 Answer general-knowledge questions (science, maths, geography, capitals, history, how things work) directly and confidently. You DO know these. Keep answers short: 1 to 3 sentences, unless she asks for more detail.
 Never comment on or rate her looks, face, body or weight, and never say anything unkind about her. You cannot see her.
-Your knowledge stops at the end of 2023 and you have no internet. For news, current leaders, sports results or anything that could have changed since 2023, say plainly that you can't know it.${surroundings()}`;
+Your knowledge stops at the end of 2023 and you have no internet. For news, current leaders, sports results or anything that could have changed since 2023, say plainly that you can't know it.${aboutHer()}${surroundings()}`;
 }
 
 function bubble(cls, text) {
