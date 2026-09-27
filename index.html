@@ -978,6 +978,10 @@ function answerFollow(q, showQuestion) {
     deskSays(pickFresh([`No worries!`, `That's okay!`, `Fair enough.`]), { motion: false, speak: false }); return;
   }
   const reply = toYou(q.replace(/[.!]+$/, '').trim()).slice(0, 80);
+  if (f.fav) {
+    store({ key: 'fav:' + f.fav, text: `Your favourite ${f.fav} is ${reply}`, x: reply }, { kind: 'fav' });
+    deskSays(pickFresh(THANKS), { motion: false, speak: false }); return;
+  }
   store({ key: 'ans:' + f.question.toLowerCase(), text: `${f.question.replace(/\?$/, '').replace(/^(?:Ooh|Fair)[.,]\s*/i, '')} → ${reply}`, x: reply }, null);
   const line = pickFresh(THANKS);
   deskSays(line, { motion: false, speak: false });
@@ -1075,10 +1079,52 @@ function answerRecall(q, showQuestion) {
   log('recall: listed memories');
 }
 
+// On 27 Sep the brain answered "Yup" by inventing "Your favourite hobby is reading, and you've got a book club meeting
+// this week." So tiny replies get a small fixed answer, and questions about herself are answered only from memory.
+const SMALL_TALK = /^\s*(thx|thanks|thank you|ty|ok|okay|k|kk|yup|yep|yeah|ya|sure|cool|nice|lol|lmao|haha+|hmm+|mhm|alright|np|no worries)[\s!.👍😊😂]*$/i;
+function smallTalk(q, showQuestion) {
+  if (showQuestion) bubble('me', q);
+  const line = pickFresh(/^\s*(thx|thanks|thank you|ty)\b/i.test(q) ? ['Anytime! 😊', 'No problem!', 'Happy to help.'] : ['👍', 'Cool.', 'Got it.', '😊']);
+  bubble('ai', line); rememberLine(line);
+  turns.push({ role: 'user', content: q }, { role: 'assistant', content: line });
+  log('small talk: answered by Desk');
+}
+const FAV_Q = /\b(?:what'?s|what is|whats|do you know|tell me|guess) my fav(?:ou?rite|orite)? ([a-z ]{2,20}?)\s*\??$/i;
+const INTO_Q = /\bwhat (?:are my hobbies|am i into|do i (?:like|love|enjoy)|are my interests)\b/i;
+function answerSelf(q, showQuestion) {
+  if (showQuestion) bubble('me', q);
+  turns.push({ role: 'user', content: q });
+  const fav = q.match(FAV_Q);
+  let line;
+  if (fav) {
+    const what = fav[1].trim().toLowerCase(), m = memories.find(x => x.key === 'fav:' + what);
+    if (m) line = `${m.text}.`;
+    else { line = `You haven't told me your favourite ${what} yet. What is it?`; following = { question: line, until: Date.now() + FOLLOW_MS, fav: what }; }
+  } else {
+    const likes = memories.filter(x => ['like', 'fav', 'skill', 'said'].includes(x.kind)).slice(-6);
+    if (likes.length) line = `From what you've told me:\n${likes.map(x => `• ${x.text}`).join('\n')}`;
+    else { line = `You haven't told me yet! What are you into?`; following = { question: line, until: Date.now() + FOLLOW_MS }; }
+  }
+  deskSays(line, { motion: false, speak: false });
+  log('question about herself: answered from memory, not the brain');
+}
+const BARE_DENIAL = /^\s*(that'?s|thats|its|it'?s)?\s*(not true|wrong|not right|incorrect|false)\s*[.!]*$|^\s*(no+|nope|nah|wrong)\s*[.!]*$/i;
+
 function userAsk(q, showQuestion) {
   if (LOOKS_Q.test(q)) { correctingUntil = 0; return answerLooks(q, showQuestion); }
   if (NAME_Q.test(q) || NAME_MEANING_Q.test(q)) { correctingUntil = 0; return answerName(q, showQuestion); }
   if (RECALL_Q.test(q)) { following = null; return answerRecall(q, showQuestion); }
+  if (FAV_Q.test(q) || INTO_Q.test(q)) { following = null; return answerSelf(q, showQuestion); }
+  // A bare "that's not true" after a head shake: ask what's right instead of letting the brain guess again.
+  if (Date.now() < correctingUntil && BARE_DENIAL.test(q)) {
+    if (showQuestion) bubble('me', q);
+    correctingUntil = Date.now() + CORRECTION_WINDOW_MS;
+    deskSays(pickFresh(["Oops. What's the right answer?", "Sorry! What should it be?"]), { motion: false, speak: false });
+    return;
+  }
+  // "Yup" or "ok" after Desk asked a question still goes on as an answer; otherwise Desk replies itself.
+  const deskAsked = lastAnswer && /\?\s*$/.test(lastAnswer) && Date.now() - lastAnswerAt < FEEDBACK_WINDOW_MS;
+  if (SMALL_TALK.test(q) && !deskAsked && !following && Date.now() >= correctingUntil) return smallTalk(q, showQuestion);
   const correcting = Date.now() < correctingUntil;
   const question = /\?\s*$/.test(q) || FACT_START.test(q);
   // Only a "?" counts here: an answer like "When I was 8" starts like a question but isn't one.
@@ -1828,7 +1874,7 @@ function systemPrompt() {
   const now = new Date().toLocaleString('en-GB', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric', hour: '2-digit', minute: '2-digit' });
   return `You are Desk, an AI assistant app on Mukta's iPad (the name is just the app's name: you are not a piece of furniture). Mukta is a 13-year-old inventor in the UK. Her name is Mukta, so if she asks her name, it is Mukta. When she says "I" or "me" she means herself. You are talking TO her, so always call her "you", never "she" or "Mukta". It is now ${now}.
 Answer general-knowledge questions (science, maths, geography, capitals, history, how things work) directly and confidently. You DO know these. Keep answers short: 1 to 3 sentences, unless she asks for more detail.
-Never comment on or rate her looks, face, body or weight, and never say anything unkind about her. You cannot see her.
+Never comment on or rate her looks, face, body or weight, and never say anything unkind about her. Never make up facts about her life (hobbies, favourites, plans, events): only use what she has told you, otherwise say she hasn't told you yet. You cannot see her.
 Your knowledge stops at the end of 2023 and you have no internet. For news, current leaders, sports results or anything that could have changed since 2023, say plainly that you can't know it.${aboutHer()}${surroundings()}`;
 }
 
@@ -1912,6 +1958,7 @@ $('loadBtn').addEventListener('click', async () => {
   const secs = Math.round((performance.now() - t0) / 1000);
   $('brainState').innerHTML = `<span class="pass">Brain ready</span> (${model}, ${secs} s)`;
   $('loadBtn').hidden = true;
+  $('brainPick').disabled = false;   // she couldn't switch once a brain was loaded (27 Sep)
   log(`brain loaded in ${secs} s`);
   setInputs();
 });
@@ -1941,6 +1988,13 @@ $('addRule').addEventListener('click', () => {
 
 $('brainPick').innerHTML = Object.entries(BRAINS).map(([k, b]) => `<option value="${k}">${b.name}</option>`).join('');
 $('brainPick').value = Object.keys(BRAINS).find(k => BRAINS[k] === brain);
+// Switching after a brain is loaded: two brains won't fit in memory at once, so Desk saves the choice and reloads.
+$('brainPick').addEventListener('change', () => {
+  if (!engine) return;
+  localStorage.setItem('desk.brain', $('brainPick').value);
+  $('brainState').innerHTML = 'Switching brains needs a fresh start. <button class="small go" id="switchBtn">Switch now (reloads the page)</button>';
+  $('switchBtn').addEventListener('click', () => location.reload());
+});
 
 // Storage = the saved downloads (brains, ears, eyes). Safari doesn't let a page see how much live memory (RAM) is left.
 async function checkSpace() {
