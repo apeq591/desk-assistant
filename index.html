@@ -1023,7 +1023,7 @@ async function maybeRemember(q, showQuestion) {
   busy = false; setInputs();
   if (!topic) return askBrain(q, false, false);
   turns.push({ role: 'user', content: q });
-  const ask = `Sounds like ${topic} matters to you. Want me to remember that?`;
+  const ask = `Sounds like you're into ${topic}. Want me to remember that?`;
   const d = bubble('ai', ask);
   const row = document.createElement('div'); row.className = 'row'; row.style.marginTop = '8px';
   const yes = document.createElement('button'), no = document.createElement('button');
@@ -1790,7 +1790,7 @@ const BRAINS = {
   llama: { name: 'Llama 3.2 1B (Meta), tested on your iPad', f16: 'Llama-3.2-1B-Instruct-q4f16_1-MLC', f32: 'Llama-3.2-1B-Instruct-q4f32_1-MLC' },
   qwen3: { name: 'Qwen3 0.6B (Alibaba), smaller, better at teaching', f16: 'Qwen3-0.6B-q4f16_1-MLC', f32: 'Qwen3-0.6B-q4f32_1-MLC',
            opts: { context_window_size: 2048 }, noThink: true },
-  qwen17: { name: 'Qwen3 1.7B (Alibaba), bigger + smarter, ~2 GB, NEW', f16: 'Qwen3-1.7B-q4f16_1-MLC', f32: 'Qwen3-1.7B-q4f32_1-MLC',
+  qwen17: { name: 'Qwen3 1.7B (Alibaba), smarter + asks before remembering, ~1 GB download', f16: 'Qwen3-1.7B-q4f16_1-MLC', f32: 'Qwen3-1.7B-q4f32_1-MLC',
            opts: { context_window_size: 2048 }, noThink: true },
 };
 let brain = BRAINS[localStorage.getItem('desk.brain')] || BRAINS.llama;
@@ -1867,14 +1867,29 @@ $('loadBtn').addEventListener('click', async () => {
   localStorage.setItem('desk.brain', $('brainPick').value);
   $('brainPick').disabled = true;
   const model = adapter.features.has('shader-f16') ? brain.f16 : brain.f32;
+  // The bigger brain needs ~1 GB saved on the iPad. Asking Safari to keep Desk's files makes it less likely to
+  // refuse space or clear them later. Then check there's room before a long download that would fail at the end.
+  if (brain === BRAINS.qwen17 && navigator.storage) {
+    const kept = await navigator.storage.persist?.().catch(() => false);
+    const est = await navigator.storage.estimate?.().catch(() => null);
+    const freeMB = est ? Math.round((est.quota - est.usage) / 1e6) : null;
+    log(`big brain: storage kept=${kept}, room for Desk ≈ ${freeMB ?? '?'} MB`);
+    if (freeMB !== null && freeMB < 1300) {
+      $('brainState').innerHTML = `<span class="fail">Safari only gives Desk about ${freeMB} MB, and the bigger brain needs ~1,300 MB. Pick Llama and tap Load again.</span>`;
+      $('brainPick').value = 'llama'; $('loadBtn').disabled = false; $('brainPick').disabled = false; return;
+    }
+  }
   const t0 = performance.now();
   try {
     engine = await webllm.CreateMLCEngine(model, {
       initProgressCallback: p => { $('loadBar').style.width = Math.round(p.progress * 100) + '%'; $('brainState').textContent = p.text; },
     }, brain.opts);
   } catch (err) {
-    $('brainState').innerHTML = `<span class="fail">Failed to load: ${err.message}</span>`;
+    const big = brain === BRAINS.qwen17;
+    $('brainState').innerHTML = `<span class="fail">Failed to load: ${err.message}</span>` +
+      (big ? '<br>The bigger brain may not fit on this iPad. I\'ve switched the menu back to Llama, so tap Load again (reload the page first if it says out of memory).' : '');
     log(`brain failed to load: ${err.message}`);
+    if (big) $('brainPick').value = 'llama';
     $('loadBtn').disabled = false; $('brainPick').disabled = false; return;
   }
   const secs = Math.round((performance.now() - t0) / 1000);
