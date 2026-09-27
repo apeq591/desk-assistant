@@ -829,7 +829,10 @@ function toYou(t) {
 }
 // The thing she's talking about: stops at the first comma/full stop/"but"/"because", max 50 characters.
 function thing(t) {
-  const x = toYou(t.split(/[,.!;]|\s(?:but|because|cos|cuz|and then)\s/i)[0].trim()).replace(/\s+/g, ' ');
+  // "and" only splits when a new bit starts ("reading and I don't have a book club" → "reading"; "French and Mandarin" stays).
+  const x = toYou(t.split(/[,.!;]|\s(?:but|because|cos|cuz|and then)\s|\s(?:and|&) (?=(?:i|i'?m|im|you|my|your|he|she|it|we|they|dont|don'?t|didn'?t|not)\b)/i)[0].trim()).replace(/\s+/g, ' ');
+  // Never save a "not": "my favourite hobby is not reading" is her saying what ISN'T true (27 Sep, it was saved as a favourite).
+  if (/^(not|never|no longer|isn'?t|aren'?t|nothing)\b/i.test(x)) return '';
   // Nothing about how she looks gets saved ("I like my hair" is fine, "I'm fat" isn't; "hot chocolate" is fine too).
   if (!x || x.length > 50 || VAGUE.test(x) || (/\byou(r|'re)?\b/i.test(x) && new RegExp(`\\b${LOOKS_W}\\b`, 'i').test(x))) return '';
   return x;
@@ -911,7 +914,9 @@ $('forgetAll').addEventListener('click', () => { memories = []; saveMemories(); 
 drawMemories();
 
 // Returns { mem, rule, isNew } if what she said is something to remember, else null.
+const CORRECTION = /^\s*(no\b|nah\b|nope\b|not\b|wrong\b|that'?s (not|wrong)|thats (not|wrong)|i (didn'?t|never) say)/i;
 function remember(q) {
+  if (CORRECTION.test(q)) return null;   // "No as in…" is fixing Desk, not telling it something new
   let s = q.trim().replace(/^(?:hey |ok |so |well |also |and )?(?:desk,? )?/i, '');
   const explicit = s.match(/^(?:please )?remember (?:that )?(.+)/i);
   if (explicit) s = explicit[1];
@@ -1048,6 +1053,17 @@ async function maybeRemember(q, showQuestion) {
   });
 }
 
+// "What do u mean" is not an answer (27 Sep: it was saved as one). A question word + a verb is a question even without "?",
+// but "When I was 8" isn't (question word + "I").
+const CONFUSED = /^(what do (you|u) mean|wdym|huh|what|what\?|i don'?t (get|understand)( it| you)?|what are you (saying|asking))\??$/i;
+const ASKING = /^\s*(what|why|how|who|where|which|when)\s+(do|does|did|is|are|was|were|can|could|would|should|will|u|you|about)\b/i;
+function reAsk(q, showQuestion) {
+  if (showQuestion) bubble('me', q);
+  turns.push({ role: 'user', content: q });
+  following.until = Date.now() + FOLLOW_MS;
+  deskSays(`Sorry, I meant: ${following.question.replace(/^(?:Ooh|Fair)[.,]\s*/i, '')}`, { motion: false, speak: false });
+}
+
 const RECALL_Q = /\bwhat (?:do you|d'?you) (?:know|remember) about me\b|\bwhat have i told you\b|\bwhat do you remember\b/i;
 function answerRecall(q, showQuestion) {
   if (showQuestion) bubble('me', q);
@@ -1068,7 +1084,8 @@ function userAsk(q, showQuestion) {
   // Only a "?" counts here: an answer like "When I was 8" starts like a question but isn't one.
   // Something new to remember wins over "answering" the last question ("I'm working on MediQ" isn't an answer to "What got you into F1?").
   const got = !correcting && remember(q);
-  if (!got && !correcting && following && Date.now() < following.until && !/\?\s*$/.test(q)) return answerFollow(q, showQuestion);
+  if (!got && following && Date.now() < following.until && CONFUSED.test(q.trim())) return reAsk(q, showQuestion);
+  if (!got && !correcting && following && Date.now() < following.until && !/\?\s*$/.test(q) && !ASKING.test(q) && !CORRECTION.test(q)) return answerFollow(q, showQuestion);
   following = null;
   if (got && !question) return curious(q, got, showQuestion);   // telling Desk something: it asks about it
   // A question that also told Desk something (e.g. "I love F1, who won in 2021?") is saved quietly and answered normally.
