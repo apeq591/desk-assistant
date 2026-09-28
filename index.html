@@ -31,6 +31,13 @@
   #timer { font:700 44px ui-monospace, monospace; text-align:center; margin:6px 0; }
   #timer.done { color:var(--on); animation:flash 1s 4; }
   @keyframes flash { 50% { opacity:.2; } }
+  #cubeClock { font:700 56px ui-monospace, monospace; text-align:center; margin:8px 0 4px; padding:10px; border-radius:12px;
+               background:#0F1115; border:2px solid var(--line); cursor:pointer; user-select:none; -webkit-user-select:none; }
+  #cubeClock.armed { border-color:var(--ok); color:var(--ok); }
+  #cubeClock.running { border-color:var(--on); }
+  #cubeClock.pb { color:var(--on); animation:flash .6s 3; }
+  .cubeStats { display:flex; justify-content:space-around; text-align:center; font-size:13px; color:var(--dim); margin-top:6px; }
+  .cubeStats b { display:block; font:700 18px ui-monospace, monospace; color:var(--text); }
   #chat { display:flex; flex-direction:column; gap:10px; max-height:40vh; overflow:auto; margin-top:12px; }
   .msg { padding:10px 14px; border-radius:12px; max-width:90%; white-space:pre-wrap; }
   .me { align-self:flex-end; background:rgba(255,106,44,.18); }
@@ -97,6 +104,20 @@
     <div class="card">
       <h2>Timer</h2>
       <div id="timer">--:--</div>
+    </div>
+
+    <div class="card">
+      <div class="row" style="justify-content:space-between"><h2>🧊 Cube timer</h2><button class="small" id="cubeBtn">Cube mode: OFF</button></div>
+      <div id="cubeClock">0.00</div>
+      <div class="state" id="cubeState" style="text-align:center">Turn cube mode on. Then show ✋, drop your hand to start, and show ✋ again to stop. Or just tap the clock.</div>
+      <div class="cubeStats">
+        <div>best<b id="cubeBest">–</b></div>
+        <div>average<b id="cubeAvg">–</b></div>
+        <div>avg of last 5<b id="cubeAo5">–</b></div>
+      </div>
+      <ul class="rules" id="cubeList"></ul>
+      <form id="cubeAddForm"><input id="cubeAdd" placeholder="add a time by hand, e.g. 1:54" autocomplete="off"><button class="small">Add</button></form>
+      <div class="row" style="justify-content:flex-end; margin-top:8px"><button class="small" id="cubeClear">Clear all times</button></div>
     </div>
 
     <div class="card">
@@ -567,6 +588,7 @@ const CHECKIN_GAP_MS = 180000, CHECKIN_HOLD_MS = 3000;
 let lastCheckIn = 0, checkedFor = null;
 function maybeCheckIn() {
   if (!['smiling', 'down', 'frowning', 'worried'].includes(expression)) { checkedFor = null; return; }
+  if (cube.on) return;                                         // don't interrupt a solve
   if (checkedFor === exprSince) return;                       // already asked about this one
   if (Date.now() - exprSince < CHECKIN_HOLD_MS) return;
   if (Date.now() - lastCheckIn < CHECKIN_GAP_MS) return;
@@ -1296,7 +1318,7 @@ function readHand(result, now) {
   const x = swings(handHist.map(h => h.x), 0.025);
   const y = swings(handHist.map(h => h.y), 0.025);
   const wave = x.range > y.range * 1.4 && ((x.turns >= 2 && x.range > WAVE_RANGE) || (x.turns >= 1 && x.range > WAVE_RANGE * 2));
-  if (wave) { lastWave = now; handHist = []; onWave(); }
+  if (wave) { lastWave = now; handHist = []; if (!cube.on) onWave(); }   // no hi/bye while solving
 }
 // Gesture rules only fire from a still hand, so waving an open palm doesn't set off the open-palm rule.
 function handStill(now) {
@@ -1447,6 +1469,7 @@ function maybeNotice() {
   if (key === noticeKey) return;                 // only when something actually changes
   noticeKey = key;
   if (first) return;                             // never on the very first reading
+  if (cube.on) return;                           // don't interrupt a solve
   if (!engine || busy || hearing || talking || pending) return;
   if (who === 'nobody' || (faceprint && who !== 'mukta')) return;
   if (awaySince) return;                         // only while you're looking at the iPad
@@ -1581,6 +1604,152 @@ function stopTimer() {
   $('timer').textContent = '--:--';
 }
 
+// ================= Cube timer: ✋ to get ready, drop your hand to start, ✋ again to stop =================
+// While cube mode is on, gesture rules, waves, check-ins and remarks are paused, so solving can't set anything off.
+// It never turns a sensor on: with the camera off, you tap the clock instead.
+const CUBE_KEY = 'desk.cube';
+const ARM_MS = 600, GO_MS = 150, STOP_MS = 400, MIN_SOLVE_MS = 5000;
+const cube = { on: false, state: 'idle', start: 0, palmSince: 0, lastPalm: 0, awaySince: 0, release: false, raf: null };
+let cubeTimes = [];
+try { cubeTimes = JSON.parse(localStorage.getItem(CUBE_KEY) || '[]').filter(t => Number.isFinite(t.ms) && t.ms > 0); } catch { cubeTimes = []; }
+
+function fmtCube(ms) {
+  const cs = Math.floor(ms / 10), m = Math.floor(cs / 6000), sec = Math.floor(cs / 100) % 60, c = cs % 100;
+  return m ? `${m}:${String(sec).padStart(2, '0')}.${String(c).padStart(2, '0')}` : `${sec}.${String(c).padStart(2, '0')}`;
+}
+function parseCube(text) {   // "1:54", "1:54.3", "114.2", "58" → ms, or null
+  const m = text.trim().match(/^(?:(\d{1,2}):)?(\d{1,3})(?:\.(\d{1,2}))?$/);
+  if (!m) return null;
+  const ms = ((+m[1] || 0) * 60 + +m[2]) * 1000 + (m[3] ? +m[3].padEnd(2, '0') * 10 : 0);
+  return ms > 0 && ms < 3600000 ? ms : null;
+}
+function cubeStats(times) {
+  const ms = times.map(t => t.ms);
+  const best = ms.length ? Math.min(...ms) : null;
+  const avg = ms.length ? ms.reduce((a, b) => a + b, 0) / ms.length : null;
+  // Average of 5, the way cubers do it: take the last 5, drop the best and the worst, average the middle 3.
+  let ao5 = null;
+  if (ms.length >= 5) { const five = ms.slice(-5).sort((a, b) => a - b); ao5 = (five[1] + five[2] + five[3]) / 3; }
+  return { best, avg, ao5 };
+}
+function drawCube() {
+  const { best, avg, ao5 } = cubeStats(cubeTimes);
+  $('cubeBest').textContent = best == null ? '–' : fmtCube(best);
+  $('cubeAvg').textContent = avg == null ? '–' : fmtCube(avg);
+  $('cubeAo5').textContent = ao5 == null ? '–' : fmtCube(ao5);
+  const items = cubeTimes.map((t, i) => ({ t, i })).slice(-10).reverse().map(({ t, i }) => {
+    const li = document.createElement('li');
+    const when = new Date(t.at).toLocaleDateString('en-GB', { day: 'numeric', month: 'short' });
+    li.innerHTML = `<span>${fmtCube(t.ms)}${t.ms === best ? ' 🏆' : ''} <span class="state" style="margin:0">${when}${t.hand ? ' · added by hand' : ''}</span></span>`;
+    const del = document.createElement('button');
+    del.className = 'small'; del.textContent = 'Delete';
+    del.addEventListener('click', () => { cubeTimes.splice(i, 1); saveCube(); log(`cube time deleted: ${fmtCube(t.ms)}`); });
+    li.append(del);
+    return li;
+  });
+  if (!items.length) { const li = document.createElement('li'); li.textContent = 'No times yet.'; items.push(li); }
+  $('cubeList').replaceChildren(...items);
+}
+function saveCube() { localStorage.setItem(CUBE_KEY, JSON.stringify(cubeTimes)); drawCube(); }
+
+function addCubeTime(ms, hand = false) {
+  const before = cubeStats(cubeTimes).best;
+  cubeTimes.push({ ms: Math.round(ms), at: Date.now(), ...(hand ? { hand: true } : {}) });
+  saveCube();
+  const pb = before != null && ms < before;
+  log(`cube time: ${fmtCube(ms)}${pb ? ' (new personal best!)' : ''}${hand ? ' (added by hand)' : ''}`);
+  return pb;
+}
+
+function cubeClock(text, cls = '') { $('cubeClock').textContent = text; $('cubeClock').className = cls; }
+function cubeSet(state, msg) { cube.state = state; if (msg != null) $('cubeState').textContent = msg; }
+function cubeTick() {
+  if (cube.state !== 'running') return;
+  cubeClock(fmtCube(performance.now() - cube.start), 'running');
+  cube.raf = requestAnimationFrame(cubeTick);
+}
+function cubeGo(at) {
+  cube.start = at;
+  cubeSet('running', 'Solving… show ✋ (or tap the clock) when you finish.');
+  cancelAnimationFrame(cube.raf); cube.raf = requestAnimationFrame(cubeTick);
+}
+function cubeStop(at) {
+  cancelAnimationFrame(cube.raf);
+  const ms = at - cube.start;
+  const pb = addCubeTime(ms);
+  cube.release = true;   // your hand has to leave the ✋ before it can get ready again
+  cubeClock(fmtCube(ms), pb ? 'pb' : '');
+  cubeSet('idle', pb ? '🎉 New personal best!' : 'Nice. Show ✋ again when you want another go.');
+  if (pb) say('New personal best!');
+}
+function cubeCancel(msg) {
+  cancelAnimationFrame(cube.raf);
+  cube.release = false;
+  cubeClock('0.00');
+  cubeSet('idle', msg);
+}
+
+// Called for every camera frame with the hand shape seen right now (not the held one), so starting and stopping is quick.
+function cubeFrame(name, now) {
+  if (!cube.on) return;
+  const palm = name === 'Open_Palm' || name === 'Four';   // a palm with the thumb a bit tucked reads as 4, so both count
+  if (palm) { if (!cube.palmSince) cube.palmSince = now; cube.lastPalm = now; cube.awaySince = 0; }
+  else { cube.palmSince = 0; if (!cube.awaySince) cube.awaySince = now; }
+  if (cube.release) { if (!palm) cube.release = false; return; }
+  if (cube.state === 'idle' && palm && now - cube.palmSince > ARM_MS) {
+    cubeClock('0.00', 'armed');
+    cubeSet('armed', 'Ready! Drop your hand to start.');
+  } else if (cube.state === 'armed' && !palm && now - cube.awaySince > GO_MS) {
+    cubeGo(cube.lastPalm);   // the clock starts from the moment your hand left, not a moment later
+  } else if (cube.state === 'running' && palm && now - cube.palmSince > STOP_MS && cube.palmSince - cube.start > MIN_SOLVE_MS) {
+    cubeStop(cube.palmSince);   // stops from the moment your ✋ appeared
+  }
+}
+
+function cubeTap() {
+  if (!cube.on) { setCube(true); }
+  if (cube.state === 'running') { const t = performance.now(); if (t - cube.start > 1000) cubeStop(t); return; }
+  cube.release = false;
+  cubeClock('0.00', 'running');
+  cubeGo(performance.now());
+}
+function setCube(on) {
+  cube.on = on;
+  $('cubeBtn').textContent = `Cube mode: ${on ? 'ON' : 'OFF'}`;
+  $('cubeBtn').classList.toggle('on', on);
+  if (on) {
+    cube.release = false;
+    cubeSet('idle', sensors.cam.stream
+      ? 'Show ✋ to get ready. Gestures, waves and chat pop-ups are paused while cube mode is on.'
+      : 'The camera is off, so tap the clock to start and stop. (Turn the camera on to use ✋.)');
+    log('cube mode on: gesture rules, waves and check-ins paused');
+  } else {
+    if (cube.state === 'running') log('cube solve cancelled (cube mode turned off)');
+    cubeCancel('Turn cube mode on. Then show ✋, drop your hand to start, and show ✋ again to stop. Or just tap the clock.');
+    log('cube mode off');
+  }
+}
+$('cubeBtn').addEventListener('click', () => setCube(!cube.on));
+$('cubeClock').addEventListener('click', cubeTap);
+document.addEventListener('keydown', e => {
+  if (e.code !== 'Space' || !cube.on || ['INPUT', 'BUTTON', 'SELECT'].includes(document.activeElement?.tagName)) return;
+  e.preventDefault(); cubeTap();
+});
+$('cubeAddForm').addEventListener('submit', e => {
+  e.preventDefault();
+  const ms = parseCube($('cubeAdd').value);
+  if (ms == null) { $('cubeState').textContent = 'Type it like 1:54 or 1:54.30 or 58.2'; return; }
+  $('cubeAdd').value = '';
+  const pb = addCubeTime(ms, true);
+  $('cubeState').textContent = `Added ${fmtCube(ms)}.${pb ? ' 🎉 That\'s a new personal best!' : ''}`;
+});
+$('cubeClear').addEventListener('click', () => {
+  if (!cubeTimes.length || !confirm(`Delete all ${cubeTimes.length} cube times? This can't be undone.`)) return;
+  cubeTimes = []; saveCube(); log('all cube times cleared');
+});
+drawCube();
+if (new URLSearchParams(location.search).has('test')) window.cubeTest = { cubeFrame, parseCube, cubeStats, fmtCube, cube };   // only for Mac tests
+
 // Is Desk talking? Normally the voice tells us when it finishes, but if it ever gets stuck saying it's still
 // talking, the ears would go deaf for good. So there's also a time limit worked out from the length of the sentence.
 let talkUntil = 0;
@@ -1660,6 +1829,7 @@ const COOLDOWN_MS = 3000;
 const lastFired = {};
 function onGesture(g, still = true) {
   log(`gesture: ${GESTURES[g]}`);
+  if (cube.on) return;   // cube mode: gestures only drive the cube timer
   const a = rules[g];
   if (!a || !ACTIONS[a]) return;
   if (!still) { log(`rule skipped: hand was moving`); return; }
@@ -1828,6 +1998,7 @@ function gestureFrame(video, now) {
     {
       const result = recognizer.recognizeForVideo(video, now);
       const name = classify(result);
+      cubeFrame(name, now);
       readHand(result, now);
       if (faceMarker && ++exprFrame % 3 === 0) readExpression(faceShapes(faceMarker.detectForVideo(video, now)));
       if (name !== candidate) { candidate = name; candidateSince = now; }
