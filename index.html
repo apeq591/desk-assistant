@@ -1153,7 +1153,7 @@ function userAsk(q, showQuestion) {
   if (RECALL_Q.test(q)) { following = null; return answerRecall(q, showQuestion); }
   if (SEE_Q.test(q)) { following = null; return answerSeen(q, showQuestion); }
   const teach = q.match(TEACH_OBJ);
-  if (teach && sensors.cam.stream && lastHands.length) { following = null; return offerLearn(cleanLabel(teach[1]), q, showQuestion); }
+  if (teach && sensors.cam.stream) { following = null; return offerLearn(cleanLabel(teach[1]), q, showQuestion); }
   if (FAV_Q.test(q) || INTO_Q.test(q)) { following = null; return answerSelf(q, showQuestion); }
   // A bare "that's not true" after a head shake: ask what's right instead of letting the brain guess again.
   if (Date.now() < correctingUntil && BARE_DENIAL.test(q)) {
@@ -1667,16 +1667,21 @@ function objectsText() {
 
 // "What am I holding?" / "What can you see?" are answered from what Desk actually spotted, never by the brain guessing.
 const SEE_Q = /\bwhat('?s| is| am i| do i have| have i got)?\s*(i'?m\s+)?(holding|in my hands?)\b|\bwhat (do|can) (you|u) see\b|\bwhat('?s| is) (this|that) (thing )?(i'?m holding|in my hand)\b|\bcan (you|u) see (what|this|my)\b/i;
-function answerSeen(q, showQuestion) {
+async function answerSeen(q, showQuestion) {
   if (showQuestion) bubble('me', typeof showQuestion === 'string' ? showQuestion : q);
   let line;
+  // Look again right now for anything you've taught it, instead of waiting for the once-a-second check.
+  const mine = sensors.cam.stream ? await lookNow() : null;
+  if (mine && !seenObjects.some(o => o.name === mine)) seenObjects = [{ name: mine, held: true }, ...seenObjects];
   if (!sensors.cam.stream) line = "My camera's off, so I can't see anything. Turn it on and ask me again.";
   else if (!objectDetector) line = "I'm still loading my eyes. Ask me again in a few seconds.";
   else {
     const held = seenObjects.filter(o => o.held).map(o => o.name), rest = seenObjects.filter(o => !o.held).map(o => o.name);
     const holdQ = /holding|in my hand/i.test(q);
     if (held.length) line = `You're holding ${andList(held.map(aOrAn))}.` + (rest.length ? ` I can also see ${andList(rest.map(aOrAn))}.` : '');
-    else if (holdQ) line = "I can't tell what's in your hand. I only know about 80 everyday things, like phones, cups, books, bottles and scissors, so it might be something I haven't learned (a Rubik's cube is one of those). Try holding it up a bit closer."
+    else if (holdQ) line = (Object.keys(learned).some(l => l !== NONE)
+        ? `I can't tell what's in your hand. If it's your ${andList(Object.keys(learned).filter(l => l !== NONE))}, hold it up in the middle of the camera. If I still miss it, teach me again from where you're sitting.`
+        : "I can't tell what's in your hand. I only know about 80 everyday things, like phones, cups, books, bottles and scissors, so it might be something I haven't learned. Hold it up and say \"this is my …\" to teach me.")
       + (rest.length ? ` I can see ${andList(rest.map(aOrAn))} though.` : '');
     else line = rest.length ? `I can see ${andList(rest.map(aOrAn))}.` : "I can't spot anything I recognise right now. I know about 80 everyday things, so it might be something I haven't learned.";
   }
@@ -1684,6 +1689,7 @@ function answerSeen(q, showQuestion) {
   log('"what do you see" question: answered from the object spotter, not the brain');
 }
 
+const wait = ms => new Promise(r => setTimeout(r, ms));
 // ================= Learning your own things (like your Rubik's cube) =================
 // Like Google's Teachable Machine: a small picture model (MobileNet-V3, on the iPad) turns the area around your hand
 // into 1,024 numbers, a "fingerprint" of what it looks like. Teaching saves ~12 fingerprints of the thing in your hand,
@@ -1708,8 +1714,17 @@ async function getEmbedder(vision) {
   return embedder;
 }
 // A square around the hand (twice its size), so whatever it's holding is inside.
-function handCrop(video) {
+// A hand wrapped round something is often NOT spotted as a hand, so with no hand it uses the middle of the picture
+// (that's why teaching says "hold it up in the middle").
+function middleCrop(video) {
+  if (!video.videoWidth) return null;
+  const W = video.videoWidth, H = video.videoHeight, side = Math.min(W, H) * 0.6;
+  cropCtx.drawImage(video, (W - side) / 2, (H - side) / 2, side, side, 0, 0, 224, 224);
+  return cropCanvas;
+}
+function handCrop(video, mode = 'auto') {
   const lm = lastHands[0];
+  if (mode === 'middle' || (!lm && mode === 'auto')) return middleCrop(video);
   if (!lm || !video.videoWidth) return null;
   const W = video.videoWidth, H = video.videoHeight;
   const xs = lm.map(p => p.x * W), ys = lm.map(p => p.y * H);
@@ -1719,8 +1734,8 @@ function handCrop(video) {
   cropCtx.drawImage(video, x, y, side, side, 0, 0, 224, 224);
   return cropCanvas;
 }
-function fingerprint(video) {
-  const crop = handCrop(video);
+function fingerprint(video, mode = 'auto') {
+  const crop = handCrop(video, mode);
   if (!crop || !embedder) return null;
   const e = embedder.embed(crop).embeddings[0]?.floatEmbedding;
   return e ? Array.from(e, v => Math.round(v * 1000) / 1000) : null;
@@ -1735,21 +1750,48 @@ function scoreLabels(fp) {
 }
 function recogniseLearned(video) {
   const labels = Object.keys(learned).filter(l => l !== NONE);
-  if (!embedder || teaching || !labels.length || !lastHands.length) { learnHist = []; return null; }
+  if (!embedder || teaching || !labels.length) { learnHist = []; return null; }
   const fp = fingerprint(video);
   if (!fp) return null;
-  const ranked = scoreLabels(fp);
-  const best = ranked[0], none = ranked.find(r => r.label === NONE);
-  const next = ranked.find(r => r.label !== best.label);
-  const ok = best.label !== NONE && best.sim >= MATCH_MIN && best.sim - (next?.sim ?? 0) >= MATCH_MARGIN;
-  $('learnScore').textContent = `learned-thing check: ${ranked.map(r => `${r.label === NONE ? 'empty hand' : r.label} ${r.sim.toFixed(2)}`).join(' · ')}`;
-  learnHist.push(ok ? best.label : null); if (learnHist.length > 3) learnHist.shift();
+  const ok = matchLabel(fp);
+  learnHist.push(ok); if (learnHist.length > 3) learnHist.shift();
   // Needs 2 of the last 3 checks to agree, so one odd frame doesn't count.
   const counts = {}; for (const l of learnHist) if (l) counts[l] = (counts[l] || 0) + 1;
   const top = Object.entries(counts).sort((a, b) => b[1] - a[1])[0];
   return top && top[1] >= 2 ? top[0] : null;
 }
+function matchLabel(fp) {
+  const ranked = scoreLabels(fp);
+  const best = ranked[0], none = ranked.find(r => r.label === NONE);
+  const next = ranked.find(r => r.label !== best.label);
+  const ok = best.label !== NONE && best.sim >= MATCH_MIN && best.sim - (next?.sim ?? 0) >= MATCH_MARGIN;
+  $('learnScore').textContent = `learned-thing check: ${ranked.map(r => `${r.label === NONE ? 'nothing' : r.label} ${r.sim.toFixed(2)}`).join(' · ')}`;
+  return ok ? best.label : null;
+}
+// A quick fresh look right now (3 checks in under a second), used when you ask "what am I holding?".
+async function lookNow() {
+  const video = $('video'), votes = {};
+  if (!embedder || !Object.keys(learned).some(l => l !== NONE)) return null;
+  for (let i = 0; i < 3; i++) {
+    const fp = fingerprint(video);
+    const l = fp && matchLabel(fp);
+    if (l) votes[l] = (votes[l] || 0) + 1;
+    await wait(200);
+  }
+  const top = Object.entries(votes).sort((a, b) => b[1] - a[1])[0];
+  return top && top[1] >= 2 ? top[0] : null;
+}
 
+// If the thing was still in view during the "empty hand" step, those looks would teach Desk that the cube = nothing,
+// and then it could never tell them apart. So any "nothing" look that's nearly identical to a taught thing is thrown out.
+const SAME_AS = 0.8;
+function untangle() {
+  const things = Object.entries(learned).filter(([l]) => l !== NONE).flatMap(([, fps]) => fps);
+  if (!learned[NONE] || !things.length) return 0;
+  const before = learned[NONE].length;
+  learned[NONE] = learned[NONE].filter(f => !things.some(t => dot(f, t) > SAME_AS));
+  return before - learned[NONE].length;
+}
 function saveLearned() {
   try { localStorage.setItem(LEARN_KEY, JSON.stringify(learned)); }
   catch (err) { log(`couldn't save what I learned: ${err.message}`); }
@@ -1777,6 +1819,7 @@ function offerLearn(label, q, showQuestion) {
   if (showQuestion) bubble('me', typeof showQuestion === 'string' ? showQuestion : q);
   if (blockedReason('teach an object')) return refuse('I only answer to Mukta');
   if (!embedder) { deskSays("I'm still loading my learning eyes. Try again in a few seconds.", { motion: false, speak: false }); return; }
+  if (teaching) return;
   const d = bubble('ai', `Want me to learn what your ${label} looks like? It takes about 10 seconds.`);
   const row = document.createElement('div'); row.className = 'row'; row.style.marginTop = '8px';
   const yes = document.createElement('button'); yes.className = 'small go'; yes.textContent = 'Yes, learn it';
@@ -1788,14 +1831,16 @@ function offerLearn(label, q, showQuestion) {
   pending = { yes: () => { row.remove(); learnObject(label); }, no: () => row.remove(), until: Date.now() + 30000, bubble: d };   // a nod works too
 }
 
-const wait = ms => new Promise(r => setTimeout(r, ms));
-async function collect(n, gapMs, status) {
+async function collect(n, gapMs, status, both = false) {
   const video = $('video'), out = [];
   for (let i = 0; i < n * 3 && out.length < n; i++) {
     if (!sensors.cam.stream) break;
     const fp = fingerprint(video);
     if (fp) out.push(fp);
-    status.textContent = `${status.dataset.text} ${'●'.repeat(out.length)}${'○'.repeat(n - out.length)}`;
+    if (both && lastHands.length) { const m = fingerprint(video, 'middle'); if (m) out.push(m); }   // empty scene: the middle of the picture too
+    const dots = `${'●'.repeat(Math.min(n, out.length))}${'○'.repeat(Math.max(0, n - out.length))}`;
+    status.textContent = `${status.dataset.text} ${dots}`;
+    $('holding').hidden = false; $('holding').textContent = `${status.dataset.chip} ${dots}`;   // on the camera, where you're looking
     await wait(gapMs);
   }
   return out;
@@ -1806,24 +1851,29 @@ async function learnObject(label) {
   log(`learning: ${label}`);
   try {
     const status = bubble('ai', '');
-    status.dataset.text = `Hold your ${label} in your hand and turn it slowly so I see different sides…`;
-    say(`Hold your ${label} up and turn it slowly.`);
+    status.dataset.text = `Hold your ${label} up in the MIDDLE of the camera and turn it slowly so I see different sides…`;
+    status.dataset.chip = `📸 learning ${label}: hold it in the middle, turn it`;
+    say(`Hold your ${label} up in the middle of the camera and turn it slowly.`);
     await wait(1500);
     const obj = await collect(12, 350, status);
-    if (obj.length < 6) { status.textContent = `I couldn't see your hand well enough (${obj.length}/12 looks). Keep your hand in view and try again.`; return; }
-    status.dataset.text = `Got it. Now put it down and show me your EMPTY hand, moving it around a bit…`;
+    if (obj.length < 6) { status.textContent = `I couldn't get enough looks (${obj.length}/12). Keep the camera on and try again.`; return; }
+    status.dataset.text = `Got it. Now put it DOWN (out of view) and show me your empty hand, moving it around a bit…`;
+    status.dataset.chip = '✋ now put it down and show your empty hand';
     say('Now put it down and show me your empty hand.');
     await wait(3000);
-    const empty = await collect(12, 350, status);
+    const empty = await collect(12, 350, status, true);
     learned[label] = [...(learned[label] || []), ...obj].slice(-36);
-    if (empty.length) learned[NONE] = [...(learned[NONE] || []), ...empty].slice(-48);
+    if (empty.length) learned[NONE] = [...(learned[NONE] || []), ...empty].slice(-72);
+    const dropped = untangle();
+    if (dropped) log(`${dropped} "empty hand" looks still showed the ${label}, so they were thrown out`);
     saveLearned();
     learnHist = [];
     status.textContent = `Learned! I'll know your ${label} now when you hold it. Teaching it again adds more looks and makes me better at it.`;
     say(`Learned! I'll know your ${label} now.`);
     log(`learned: ${label} (${obj.length} looks of it, ${empty.length} of your empty hand)`);
-  } finally { teaching = false; }
+  } finally { teaching = false; drawObjects(); }
 }
+{ const n = untangle(); if (n) { saveLearned(); log(`cleaned up ${n} mixed-up "nothing" looks from before`); } }   // fixes things taught with the old version
 drawLearned();
 
 // ================= Timer =================
