@@ -38,6 +38,8 @@
   #cubeClock.pb { color:var(--on); animation:flash .6s 3; }
   #cubeOverlay { position:absolute; left:50%; top:10px; transform:translateX(-50%); padding:6px 18px; border-radius:14px; background:rgba(0,0,0,.72);
                  font:700 48px ui-monospace, monospace; text-align:center; border:2px solid var(--line); cursor:pointer; }
+  #cubeStopBtn { position:absolute; left:50%; bottom:50px; transform:translateX(-50%); width:60%; padding:22px; font:800 30px system-ui;
+                 border:3px solid var(--on); background:rgba(255,106,44,.85); color:#fff; border-radius:18px; touch-action:manipulation; }
   #cubeOverlay small { display:block; font:600 14px system-ui; color:var(--dim); }
   #cubeOverlay.armed { border-color:var(--ok); color:var(--ok); }
   #cubeOverlay.running { border-color:var(--on); }
@@ -79,6 +81,7 @@
         <video id="video" playsinline muted></video>
         <div class="gesture" id="gesture">…</div>
         <div id="cubeOverlay" hidden></div>
+        <button id="cubeStopBtn" hidden>⏹ STOP</button>
         <div class="gesture" id="motion" style="bottom:auto; top:10px" hidden></div>
         <div class="state" id="headMeter" style="position:absolute; right:10px; bottom:10px; background:rgba(0,0,0,.6); padding:2px 8px; border-radius:8px"></div>
         <div class="state" id="gap" style="position:absolute; right:10px; top:2px; background:rgba(0,0,0,.6); padding:2px 8px; border-radius:8px"></div>
@@ -1678,7 +1681,11 @@ function cubeClock(text, cls = '', note = '') {
   $('cubeOverlay').className = cls;
   $('cubeOverlay').innerHTML = `${text}${note ? `<small>${note}</small>` : ''}`;
 }
-function cubeSet(state, msg) { cube.state = state; if (msg != null) $('cubeState').textContent = msg; }
+function cubeSet(state, msg) {
+  cube.state = state;
+  if (msg != null) $('cubeState').textContent = msg;
+  $('cubeStopBtn').hidden = state !== 'running';   // big stop button on the camera, only while solving
+}
 function cubeTick() {
   if (cube.state !== 'running') return;
   const ms = performance.now() - cube.start;
@@ -1688,7 +1695,7 @@ function cubeTick() {
 }
 function cubeGo(at) {
   cube.start = at;
-  cubeSet('running', 'Solving… put the cube down and show ✋✋ (or tap the clock) when you finish.');
+  cubeSet('running', 'Solving… press ⏹ STOP on the camera (or show ✋✋) when you finish.');
   cancelAnimationFrame(cube.raf); cube.raf = requestAnimationFrame(cubeTick);
 }
 function cubeStop(at) {
@@ -1743,6 +1750,11 @@ function cubeTap() {
 }
 $('cubeClock').addEventListener('click', cubeTap);
 $('cubeOverlay').addEventListener('click', cubeTap);
+// Stops on the press itself (pointerdown), not the lift, so it's as quick as possible.
+$('cubeStopBtn').addEventListener('pointerdown', e => {
+  e.preventDefault();
+  if (cube.state === 'running' && performance.now() - cube.start > 1000) { cubeStop(performance.now()); log('cube stopped with the button'); }
+});
 $('cubeAddForm').addEventListener('submit', e => {
   e.preventDefault();
   const ms = parseCube($('cubeAdd').value);
