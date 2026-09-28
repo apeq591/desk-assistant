@@ -111,6 +111,9 @@
       <div class="row" id="colours" style="flex-wrap:wrap; gap:6px; margin-top:8px"><span class="state" style="margin:0">camera off</span></div>
       <div class="state" id="topColour"></div>
       <div class="state" id="objects"></div>
+      <div class="state" style="margin-top:10px">Things you've taught me · hold something and say "this is my Rubik's cube"</div>
+      <ul class="rules" id="learnedList"></ul>
+      <div class="state" id="learnScore"></div>
     </div>
 
     <div class="card">
@@ -181,7 +184,7 @@
 </div>
 
 <script type="module">
-import { FilesetResolver, GestureRecognizer, FaceLandmarker, ObjectDetector } from 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.0.1/vision_bundle.mjs';
+import { FilesetResolver, GestureRecognizer, FaceLandmarker, ObjectDetector, ImageEmbedder } from 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.0.1/vision_bundle.mjs';
 import * as webllm from 'https://cdn.jsdelivr.net/npm/@mlc-ai/web-llm@0.2.85/+esm';
 
 const $ = id => document.getElementById(id);
@@ -1149,6 +1152,8 @@ function userAsk(q, showQuestion) {
   if (NAME_Q.test(q) || NAME_MEANING_Q.test(q)) { correctingUntil = 0; return answerName(q, showQuestion); }
   if (RECALL_Q.test(q)) { following = null; return answerRecall(q, showQuestion); }
   if (SEE_Q.test(q)) { following = null; return answerSeen(q, showQuestion); }
+  const teach = q.match(TEACH_OBJ);
+  if (teach && sensors.cam.stream && lastHands.length) { following = null; return offerLearn(cleanLabel(teach[1]), q, showQuestion); }
   if (FAV_Q.test(q) || INTO_Q.test(q)) { following = null; return answerSelf(q, showQuestion); }
   // A bare "that's not true" after a head shake: ask what's right instead of letting the brain guess again.
   if (Date.now() < correctingUntil && BARE_DENIAL.test(q)) {
@@ -1631,6 +1636,8 @@ function readObjects(video, now) {
     const name = OBJ_NAMES[raw] || raw;
     found[name] = found[name] || inHand(det.boundingBox, W, H);
   }
+  const mine = recogniseLearned(video);
+  if (mine) found[mine] = true;   // something you taught it, in your hand
   setObjects(found);
 }
 // Smoothing: something only counts once it's been seen in 2 of the last 3 looks, so one-off misreads don't show up.
@@ -1676,6 +1683,148 @@ function answerSeen(q, showQuestion) {
   deskSays(line, { motion: false, speak: false });
   log('"what do you see" question: answered from the object spotter, not the brain');
 }
+
+// ================= Learning your own things (like your Rubik's cube) =================
+// Like Google's Teachable Machine: a small picture model (MobileNet-V3, on the iPad) turns the area around your hand
+// into 1,024 numbers, a "fingerprint" of what it looks like. Teaching saves ~12 fingerprints of the thing in your hand,
+// plus ~12 of your EMPTY hand, so Desk can tell "hand holding the cube" from "just a hand".
+// Recognising = finding the closest saved fingerprint. Only numbers are saved (on this iPad), never pictures.
+let embedder = null, testHand = null;
+const LEARN_KEY = 'desk.learned', NONE = '_empty_hand';
+let learned = {};
+try { learned = JSON.parse(localStorage.getItem(LEARN_KEY) || '{}'); } catch { learned = {}; }
+const cropCanvas = document.createElement('canvas'); cropCanvas.width = cropCanvas.height = 224;
+const cropCtx = cropCanvas.getContext('2d', { willReadFrequently: true });
+const MATCH_MIN = 0.55, MATCH_MARGIN = 0.03;   // tune with the numbers shown in the log
+let learnHist = [], teaching = false;
+
+async function getEmbedder(vision) {
+  if (embedder) return embedder;
+  embedder = await ImageEmbedder.createFromOptions(vision, {
+    baseOptions: { modelAssetPath: './models/object_embedder.tflite', delegate: 'CPU' },
+    runningMode: 'IMAGE', l2Normalize: true, quantize: false,
+  });
+  log('object learner loaded');
+  return embedder;
+}
+// A square around the hand (twice its size), so whatever it's holding is inside.
+function handCrop(video) {
+  const lm = lastHands[0];
+  if (!lm || !video.videoWidth) return null;
+  const W = video.videoWidth, H = video.videoHeight;
+  const xs = lm.map(p => p.x * W), ys = lm.map(p => p.y * H);
+  const cx = (Math.min(...xs) + Math.max(...xs)) / 2, cy = (Math.min(...ys) + Math.max(...ys)) / 2;
+  const side = Math.min(W, H, Math.max(Math.max(...xs) - Math.min(...xs), Math.max(...ys) - Math.min(...ys)) * 2);
+  const x = Math.max(0, Math.min(W - side, cx - side / 2)), y = Math.max(0, Math.min(H - side, cy - side / 2));
+  cropCtx.drawImage(video, x, y, side, side, 0, 0, 224, 224);
+  return cropCanvas;
+}
+function fingerprint(video) {
+  const crop = handCrop(video);
+  if (!crop || !embedder) return null;
+  const e = embedder.embed(crop).embeddings[0]?.floatEmbedding;
+  return e ? Array.from(e, v => Math.round(v * 1000) / 1000) : null;
+}
+const dot = (a, b) => { let s = 0; for (let i = 0; i < a.length; i++) s += a[i] * b[i]; return s; };
+// Closest match per label = the average of its 3 closest saved fingerprints.
+function scoreLabels(fp) {
+  return Object.entries(learned).map(([label, fps]) => {
+    const sims = fps.map(f => dot(fp, f)).sort((a, b) => b - a).slice(0, 3);
+    return { label, sim: sims.reduce((a, b) => a + b, 0) / sims.length };
+  }).sort((a, b) => b.sim - a.sim);
+}
+function recogniseLearned(video) {
+  const labels = Object.keys(learned).filter(l => l !== NONE);
+  if (!embedder || teaching || !labels.length || !lastHands.length) { learnHist = []; return null; }
+  const fp = fingerprint(video);
+  if (!fp) return null;
+  const ranked = scoreLabels(fp);
+  const best = ranked[0], none = ranked.find(r => r.label === NONE);
+  const next = ranked.find(r => r.label !== best.label);
+  const ok = best.label !== NONE && best.sim >= MATCH_MIN && best.sim - (next?.sim ?? 0) >= MATCH_MARGIN;
+  $('learnScore').textContent = `learned-thing check: ${ranked.map(r => `${r.label === NONE ? 'empty hand' : r.label} ${r.sim.toFixed(2)}`).join(' · ')}`;
+  learnHist.push(ok ? best.label : null); if (learnHist.length > 3) learnHist.shift();
+  // Needs 2 of the last 3 checks to agree, so one odd frame doesn't count.
+  const counts = {}; for (const l of learnHist) if (l) counts[l] = (counts[l] || 0) + 1;
+  const top = Object.entries(counts).sort((a, b) => b[1] - a[1])[0];
+  return top && top[1] >= 2 ? top[0] : null;
+}
+
+function saveLearned() {
+  try { localStorage.setItem(LEARN_KEY, JSON.stringify(learned)); }
+  catch (err) { log(`couldn't save what I learned: ${err.message}`); }
+  drawLearned();
+}
+function drawLearned() {
+  const items = Object.entries(learned).filter(([l]) => l !== NONE).map(([label, fps]) => {
+    const li = document.createElement('li');
+    li.innerHTML = `<span>${label} <span class="state" style="margin:0">${fps.length} looks</span></span>`;
+    const del = document.createElement('button');
+    del.className = 'small'; del.textContent = 'Forget';
+    del.addEventListener('click', () => { delete learned[label]; saveLearned(); log(`forgot: ${label}`); });
+    li.append(del);
+    return li;
+  });
+  if (!items.length) { const li = document.createElement('li'); li.textContent = 'Nothing yet.'; items.push(li); }
+  $('learnedList').replaceChildren(...items);
+}
+
+// "this is my Rubik's cube", "it's a rubiks cube", "learn this as my pencil case", "this is called a fidget spinner"
+const TEACH_OBJ = /^\s*(?:this is|this'?s|thats|that'?s|it'?s|it is|learn this as|remember this is|this is called|it'?s called)\s+(?:(?:a|an|my|the|called)\s+)+([a-z0-9'’\- ]{2,30}?)\s*[.!]*\s*$/i;
+const cleanLabel = t => t.trim().toLowerCase().replace(/[’]/g, "'").replace(/\brubiks\b/, "rubik's").replace(/^rubik'?s$/, "rubik's cube");
+
+function offerLearn(label, q, showQuestion) {
+  if (showQuestion) bubble('me', typeof showQuestion === 'string' ? showQuestion : q);
+  if (blockedReason('teach an object')) return refuse('I only answer to Mukta');
+  if (!embedder) { deskSays("I'm still loading my learning eyes. Try again in a few seconds.", { motion: false, speak: false }); return; }
+  const d = bubble('ai', `Want me to learn what your ${label} looks like? It takes about 10 seconds.`);
+  const row = document.createElement('div'); row.className = 'row'; row.style.marginTop = '8px';
+  const yes = document.createElement('button'); yes.className = 'small go'; yes.textContent = 'Yes, learn it';
+  const no = document.createElement('button'); no.className = 'small'; no.textContent = 'No';
+  const done = () => { row.remove(); pending = null; };
+  yes.addEventListener('click', () => { done(); learnObject(label); });
+  no.addEventListener('click', () => { done(); deskSays('Okay, I won\'t.', { motion: false, speak: false }); });
+  row.append(yes, no); d.append(row);
+  pending = { yes: () => { row.remove(); learnObject(label); }, no: () => row.remove(), until: Date.now() + 30000, bubble: d };   // a nod works too
+}
+
+const wait = ms => new Promise(r => setTimeout(r, ms));
+async function collect(n, gapMs, status) {
+  const video = $('video'), out = [];
+  for (let i = 0; i < n * 3 && out.length < n; i++) {
+    if (!sensors.cam.stream) break;
+    const fp = fingerprint(video);
+    if (fp) out.push(fp);
+    status.textContent = `${status.dataset.text} ${'●'.repeat(out.length)}${'○'.repeat(n - out.length)}`;
+    await wait(gapMs);
+  }
+  return out;
+}
+async function learnObject(label) {
+  if (teaching) return;
+  teaching = true;
+  log(`learning: ${label}`);
+  try {
+    const status = bubble('ai', '');
+    status.dataset.text = `Hold your ${label} in your hand and turn it slowly so I see different sides…`;
+    say(`Hold your ${label} up and turn it slowly.`);
+    await wait(1500);
+    const obj = await collect(12, 350, status);
+    if (obj.length < 6) { status.textContent = `I couldn't see your hand well enough (${obj.length}/12 looks). Keep your hand in view and try again.`; return; }
+    status.dataset.text = `Got it. Now put it down and show me your EMPTY hand, moving it around a bit…`;
+    say('Now put it down and show me your empty hand.');
+    await wait(3000);
+    const empty = await collect(12, 350, status);
+    learned[label] = [...(learned[label] || []), ...obj].slice(-36);
+    if (empty.length) learned[NONE] = [...(learned[NONE] || []), ...empty].slice(-48);
+    saveLearned();
+    learnHist = [];
+    status.textContent = `Learned! I'll know your ${label} now when you hold it. Teaching it again adds more looks and makes me better at it.`;
+    say(`Learned! I'll know your ${label} now.`);
+    log(`learned: ${label} (${obj.length} looks of it, ${empty.length} of your empty hand)`);
+  } finally { teaching = false; }
+}
+drawLearned();
 
 // ================= Timer =================
 let timerEnd = 0, timerId = null, timerMins = 0;
@@ -1858,7 +2007,7 @@ $('cubeClear').addEventListener('click', () => {
   cubeTimes = []; saveCube(); log('all cube times cleared');
 });
 drawCube();
-if (new URLSearchParams(location.search).has('test')) window.cubeTest = { cubeFrame, parseCube, cubeStats, fmtCube, cube, heldTest: (hands, box) => { lastHands = hands; const r = inHand(box, 640, 480); lastHands = []; return r; } };   // only for Mac tests
+if (new URLSearchParams(location.search).has('test')) window.cubeTest = { setTestHand: h => { testHand = h; }, collectAs: async (label, n) => { const st = document.createElement('div'); st.dataset.text = ''; learned[label] = [...(learned[label] || []), ...await collect(n, 100, st)]; saveLearned(); return learned[label].length; }, NONE, learnObject, get learned() { return learned; }, cubeFrame, parseCube, cubeStats, fmtCube, cube, heldTest: (hands, box) => { lastHands = hands; const r = inHand(box, 640, 480); lastHands = []; return r; } };   // only for Mac tests
 
 // Is Desk talking? Normally the voice tells us when it finishes, but if it ever gets stuck saying it's still
 // talking, the ears would go deaf for good. So there's also a time limit worked out from the length of the sentence.
@@ -2050,6 +2199,7 @@ async function getRecognizer() {
   });
   try { await getFaceMarker(vision); } catch (err) { log(`expression reader failed to load: ${err.message}`); }
   try { await getObjectDetector(vision); } catch (err) { log(`object spotter failed to load: ${err.message}`); }
+  try { await getEmbedder(vision); } catch (err) { log(`object learner failed to load: ${err.message}`); }
   return recognizer;
 }
 
@@ -2114,7 +2264,7 @@ function gestureFrame(video, now) {
       // With two hands up, the one-hand gestures are ignored (either hand could be read, and ✋✋ belongs to the cube timer).
       const name = hands === 2 ? null : classify(result);
       readHand(result, now);
-      lastHands = result.landmarks || [];
+      lastHands = testHand || result.landmarks || [];
       if (objectDetector && ++objFrame % 20 === 0 && !cubeBusy()) readObjects(video, now);   // about once a second, not while solving
       if (faceMarker && ++exprFrame % 3 === 0) readExpression(faceShapes(faceMarker.detectForVideo(video, now)));
       if (name !== candidate) { candidate = name; candidateSince = now; }
