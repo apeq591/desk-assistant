@@ -81,6 +81,7 @@
         <video id="video" playsinline muted></video>
         <div class="gesture" id="gesture">…</div>
         <div id="cubeOverlay" hidden></div>
+        <div class="gesture" id="holding" style="bottom:56px; font-size:15px" hidden></div>
         <button id="cubeStopBtn" hidden>⏹ STOP</button>
         <div class="gesture" id="motion" style="bottom:auto; top:10px" hidden></div>
         <div class="state" id="headMeter" style="position:absolute; right:10px; bottom:10px; background:rgba(0,0,0,.6); padding:2px 8px; border-radius:8px"></div>
@@ -109,6 +110,7 @@
       <h2>What I see</h2>
       <div class="row" id="colours" style="flex-wrap:wrap; gap:6px; margin-top:8px"><span class="state" style="margin:0">camera off</span></div>
       <div class="state" id="topColour"></div>
+      <div class="state" id="objects"></div>
     </div>
 
     <div class="card">
@@ -179,7 +181,7 @@
 </div>
 
 <script type="module">
-import { FilesetResolver, GestureRecognizer, FaceLandmarker } from 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.0.1/vision_bundle.mjs';
+import { FilesetResolver, GestureRecognizer, FaceLandmarker, ObjectDetector } from 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.0.1/vision_bundle.mjs';
 import * as webllm from 'https://cdn.jsdelivr.net/npm/@mlc-ai/web-llm@0.2.85/+esm';
 
 const $ = id => document.getElementById(id);
@@ -1146,6 +1148,7 @@ function userAsk(q, showQuestion) {
   if (LOOKS_Q.test(q)) { correctingUntil = 0; return answerLooks(q, showQuestion); }
   if (NAME_Q.test(q) || NAME_MEANING_Q.test(q)) { correctingUntil = 0; return answerName(q, showQuestion); }
   if (RECALL_Q.test(q)) { following = null; return answerRecall(q, showQuestion); }
+  if (SEE_Q.test(q)) { following = null; return answerSeen(q, showQuestion); }
   if (FAV_Q.test(q) || INTO_Q.test(q)) { following = null; return answerSelf(q, showQuestion); }
   // A bare "that's not true" after a head shake: ask what's right instead of letting the brain guess again.
   if (Date.now() < correctingUntil && BARE_DENIAL.test(q)) {
@@ -1571,6 +1574,7 @@ function readColours() {
 function startColours() { clearInterval(colourTimer); colourTimer = setInterval(() => { readColours(); maybeNotice(); }, 2000); setTimeout(readColours, 500); }
 function stopColours() {
   clearInterval(colourTimer); seenColours = null;
+  clearObjects();
   $('colours').innerHTML = '<span class="state" style="margin:0">camera off</span>';
   $('topColour').textContent = '';
 }
@@ -1584,7 +1588,93 @@ function surroundings() {
   const list = seenColours.all.map(c => `${c.name} (${c.pct}%)`).join(', ');
   return `\nThe iPad camera is on. The main colours it sees right now are: ${list}.` +
     (seenColours.top ? ` The colour just below Mukta's face, probably her top, is ${seenColours.top.name}.` : '') +
-    ` You can only see colours, nothing else. Never make up clothes, objects, people or details you weren't told.` + face;
+    objectsText() +
+    ` You can only see these colours${seenObjects.length ? ' and these objects' : ''}, nothing else. Never make up clothes, objects, people or details you weren't told.` + face;
+}
+
+// ================= Objects: what's on the desk and what's in your hand =================
+// Google's EfficientDet-Lite0 (runs on the iPad, CPU) knows 80 everyday things: phone, cup, book, bottle, scissors, laptop…
+// It does NOT know everything (a Rubik's cube isn't one of them). People are never listed.
+// Only the names come out; the picture isn't kept.
+let objectDetector = null, objFrame = 0, lastHands = [], objHist = [], seenObjects = [];
+const OBJ_NAMES = { 'cell phone': 'phone', 'sports ball': 'ball', 'dining table': 'table', tv: 'screen', 'potted plant': 'plant',
+  mouse: 'computer mouse', remote: 'remote control', 'wine glass': 'glass', 'hair drier': 'hair dryer', 'teddy bear': 'teddy bear' };
+const SKIP_OBJ = new Set(['person', 'bed', 'toilet', 'car', 'truck', 'bus', 'train', 'airplane', 'boat', 'horse', 'sheep', 'cow', 'elephant', 'bear', 'zebra', 'giraffe']);   // people, and things that can't be on a desk (usually misreads)
+const aOrAn = w => (/^[aeiou]/i.test(w) ? 'an ' : 'a ') + w;
+const andList = xs => xs.length < 2 ? xs.join('') : `${xs.slice(0, -1).join(', ')} and ${xs.at(-1)}`;
+
+async function getObjectDetector(vision) {
+  if (objectDetector) return objectDetector;
+  objectDetector = await ObjectDetector.createFromOptions(vision, {
+    baseOptions: { modelAssetPath: './models/object_detector.tflite', delegate: 'CPU' },
+    runningMode: 'VIDEO', scoreThreshold: 0.45, maxResults: 6,
+  });
+  log('object spotter loaded (80 everyday things)');
+  return objectDetector;
+}
+
+// Is the object in your hand? At least 3 of the hand's 21 points sit inside the object's box (made a bit bigger).
+function inHand(box, W, H) {
+  const pad = 0.15, x0 = box.originX / W - box.width / W * pad, x1 = (box.originX + box.width) / W + box.width / W * pad;
+  const y0 = box.originY / H - box.height / H * pad, y1 = (box.originY + box.height) / H + box.height / H * pad;
+  return lastHands.some(lm => lm.filter(p => p.x >= x0 && p.x <= x1 && p.y >= y0 && p.y <= y1).length >= 3);
+}
+
+function readObjects(video, now) {
+  let res;
+  try { res = objectDetector.detectForVideo(video, now); } catch (err) { logError(`object spotter error: ${err.message}`); return; }
+  const W = video.videoWidth || 640, H = video.videoHeight || 480;
+  const found = {};
+  for (const det of res.detections || []) {
+    const raw = det.categories[0]?.categoryName;
+    if (!raw || SKIP_OBJ.has(raw)) continue;
+    const name = OBJ_NAMES[raw] || raw;
+    found[name] = found[name] || inHand(det.boundingBox, W, H);
+  }
+  setObjects(found);
+}
+// Smoothing: something only counts once it's been seen in 2 of the last 3 looks, so one-off misreads don't show up.
+function setObjects(found) {
+  objHist.push(found); if (objHist.length > 3) objHist.shift();
+  const names = new Set(objHist.flatMap(f => Object.keys(f)));
+  seenObjects = [...names].filter(n => objHist.filter(f => n in f).length >= 2)
+    .map(n => ({ name: n, held: objHist.slice(-2).some(f => f[n]) }))
+    .sort((a, b) => b.held - a.held);
+  drawObjects();
+}
+function drawObjects() {
+  const held = seenObjects.filter(o => o.held).map(o => o.name);
+  const rest = seenObjects.filter(o => !o.held).map(o => o.name);
+  $('objects').textContent = seenObjects.length
+    ? `Objects: ${[...held.map(n => `${n} (in your hand)`), ...rest].join(', ')}`
+    : (sensors.cam.stream && objectDetector ? 'Objects: nothing I recognise' : '');
+  $('holding').hidden = !held.length;
+  $('holding').textContent = held.length ? `✋ holding: ${held.join(', ')}` : '';
+}
+function clearObjects() { objHist = []; seenObjects = []; lastHands = []; $('objects').textContent = ''; $('holding').hidden = true; }
+function objectsText() {
+  if (!seenObjects.length) return '';
+  const held = seenObjects.filter(o => o.held).map(o => o.name), rest = seenObjects.filter(o => !o.held).map(o => o.name);
+  return (held.length ? ` Mukta is holding: ${held.join(', ')}.` : '') + (rest.length ? ` Objects in view: ${rest.join(', ')}.` : '');
+}
+
+// "What am I holding?" / "What can you see?" are answered from what Desk actually spotted, never by the brain guessing.
+const SEE_Q = /\bwhat('?s| is| am i| do i have| have i got)?\s*(i'?m\s+)?(holding|in my hands?)\b|\bwhat (do|can) (you|u) see\b|\bwhat('?s| is) (this|that) (thing )?(i'?m holding|in my hand)\b|\bcan (you|u) see (what|this|my)\b/i;
+function answerSeen(q, showQuestion) {
+  if (showQuestion) bubble('me', typeof showQuestion === 'string' ? showQuestion : q);
+  let line;
+  if (!sensors.cam.stream) line = "My camera's off, so I can't see anything. Turn it on and ask me again.";
+  else if (!objectDetector) line = "I'm still loading my eyes. Ask me again in a few seconds.";
+  else {
+    const held = seenObjects.filter(o => o.held).map(o => o.name), rest = seenObjects.filter(o => !o.held).map(o => o.name);
+    const holdQ = /holding|in my hand/i.test(q);
+    if (held.length) line = `You're holding ${andList(held.map(aOrAn))}.` + (rest.length ? ` I can also see ${andList(rest.map(aOrAn))}.` : '');
+    else if (holdQ) line = "I can't tell what's in your hand. I only know about 80 everyday things, like phones, cups, books, bottles and scissors, so it might be something I haven't learned (a Rubik's cube is one of those). Try holding it up a bit closer."
+      + (rest.length ? ` I can see ${andList(rest.map(aOrAn))} though.` : '');
+    else line = rest.length ? `I can see ${andList(rest.map(aOrAn))}.` : "I can't spot anything I recognise right now. I know about 80 everyday things, so it might be something I haven't learned.";
+  }
+  deskSays(line, { motion: false, speak: false });
+  log('"what do you see" question: answered from the object spotter, not the brain');
 }
 
 // ================= Timer =================
@@ -1768,7 +1858,7 @@ $('cubeClear').addEventListener('click', () => {
   cubeTimes = []; saveCube(); log('all cube times cleared');
 });
 drawCube();
-if (new URLSearchParams(location.search).has('test')) window.cubeTest = { cubeFrame, parseCube, cubeStats, fmtCube, cube };   // only for Mac tests
+if (new URLSearchParams(location.search).has('test')) window.cubeTest = { cubeFrame, parseCube, cubeStats, fmtCube, cube, heldTest: (hands, box) => { lastHands = hands; const r = inHand(box, 640, 480); lastHands = []; return r; } };   // only for Mac tests
 
 // Is Desk talking? Normally the voice tells us when it finishes, but if it ever gets stuck saying it's still
 // talking, the ears would go deaf for good. So there's also a time limit worked out from the length of the sentence.
@@ -1959,6 +2049,7 @@ async function getRecognizer() {
     runningMode: 'VIDEO', numHands: 2,   // 2 so the cube timer can see both hands; everything else uses the first hand
   });
   try { await getFaceMarker(vision); } catch (err) { log(`expression reader failed to load: ${err.message}`); }
+  try { await getObjectDetector(vision); } catch (err) { log(`object spotter failed to load: ${err.message}`); }
   return recognizer;
 }
 
@@ -2023,6 +2114,8 @@ function gestureFrame(video, now) {
       // With two hands up, the one-hand gestures are ignored (either hand could be read, and ✋✋ belongs to the cube timer).
       const name = hands === 2 ? null : classify(result);
       readHand(result, now);
+      lastHands = result.landmarks || [];
+      if (objectDetector && ++objFrame % 20 === 0 && !cubeBusy()) readObjects(video, now);   // about once a second, not while solving
       if (faceMarker && ++exprFrame % 3 === 0) readExpression(faceShapes(faceMarker.detectForVideo(video, now)));
       if (name !== candidate) { candidate = name; candidateSince = now; }
       else if (name !== confirmed && now - candidateSince > HOLD_MS) {
