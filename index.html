@@ -36,6 +36,12 @@
   #cubeClock.armed { border-color:var(--ok); color:var(--ok); }
   #cubeClock.running { border-color:var(--on); }
   #cubeClock.pb { color:var(--on); animation:flash .6s 3; }
+  #cubeOverlay { position:absolute; left:50%; top:10px; transform:translateX(-50%); padding:6px 18px; border-radius:14px; background:rgba(0,0,0,.72);
+                 font:700 48px ui-monospace, monospace; text-align:center; border:2px solid var(--line); cursor:pointer; }
+  #cubeOverlay small { display:block; font:600 14px system-ui; color:var(--dim); }
+  #cubeOverlay.armed { border-color:var(--ok); color:var(--ok); }
+  #cubeOverlay.running { border-color:var(--on); }
+  #cubeOverlay.pb { color:var(--on); border-color:var(--on); animation:flash .6s 3; }
   .cubeStats { display:flex; justify-content:space-around; text-align:center; font-size:13px; color:var(--dim); margin-top:6px; }
   .cubeStats b { display:block; font:700 18px ui-monospace, monospace; color:var(--text); }
   #chat { display:flex; flex-direction:column; gap:10px; max-height:40vh; overflow:auto; margin-top:12px; }
@@ -72,6 +78,7 @@
       <div class="stage" id="stage" hidden>
         <video id="video" playsinline muted></video>
         <div class="gesture" id="gesture">…</div>
+        <div id="cubeOverlay" hidden></div>
         <div class="gesture" id="motion" style="bottom:auto; top:10px" hidden></div>
         <div class="state" id="headMeter" style="position:absolute; right:10px; bottom:10px; background:rgba(0,0,0,.6); padding:2px 8px; border-radius:8px"></div>
         <div class="state" id="gap" style="position:absolute; right:10px; top:2px; background:rgba(0,0,0,.6); padding:2px 8px; border-radius:8px"></div>
@@ -107,9 +114,9 @@
     </div>
 
     <div class="card">
-      <div class="row" style="justify-content:space-between"><h2>🧊 Cube timer</h2><button class="small" id="cubeBtn">Cube mode: OFF</button></div>
+      <h2>🧊 Cube timer</h2>
       <div id="cubeClock">0.00</div>
-      <div class="state" id="cubeState" style="text-align:center">Turn cube mode on. Then show ✋, drop your hand to start, and show ✋ again to stop. Or just tap the clock.</div>
+      <div class="state" id="cubeState" style="text-align:center">Always on with the camera: hold up both hands flat ✋✋ to get ready, lift them to start, ✋✋ again to stop. Or tap the clock.</div>
       <div class="cubeStats">
         <div>best<b id="cubeBest">–</b></div>
         <div>average<b id="cubeAvg">–</b></div>
@@ -588,7 +595,7 @@ const CHECKIN_GAP_MS = 180000, CHECKIN_HOLD_MS = 3000;
 let lastCheckIn = 0, checkedFor = null;
 function maybeCheckIn() {
   if (!['smiling', 'down', 'frowning', 'worried'].includes(expression)) { checkedFor = null; return; }
-  if (cube.on) return;                                         // don't interrupt a solve
+  if (cubeBusy()) return;                                      // don't interrupt a solve
   if (checkedFor === exprSince) return;                       // already asked about this one
   if (Date.now() - exprSince < CHECKIN_HOLD_MS) return;
   if (Date.now() - lastCheckIn < CHECKIN_GAP_MS) return;
@@ -1311,14 +1318,14 @@ const WAVE_COOLDOWN_MS = 3000, HI_WINDOW_MS = 60000, WAVE_RANGE = 0.07;
 let handHist = [], lastWave = 0;
 function readHand(result, now) {
   const lm = result.landmarks[0];
-  if (!lm) { handHist = []; return; }
+  if (!lm || result.landmarks.length > 1) { handHist = []; return; }   // waves are one hand; two hands would mix positions
   handHist.push({ t: now, x: (lm[9].x + lm[12].x) / 2, y: (lm[9].y + lm[12].y) / 2, kx: lm[9].x });
   handHist = handHist.filter(h => now - h.t < MOVE_WINDOW_MS);
   if (handHist.length < 6 || now - lastWave < WAVE_COOLDOWN_MS) return;
   const x = swings(handHist.map(h => h.x), 0.025);
   const y = swings(handHist.map(h => h.y), 0.025);
   const wave = x.range > y.range * 1.4 && ((x.turns >= 2 && x.range > WAVE_RANGE) || (x.turns >= 1 && x.range > WAVE_RANGE * 2));
-  if (wave) { lastWave = now; handHist = []; if (!cube.on) onWave(); }   // no hi/bye while solving
+  if (wave) { lastWave = now; handHist = []; if (!cubeBusy()) onWave(); }   // no hi/bye while solving
 }
 // Gesture rules only fire from a still hand, so waving an open palm doesn't set off the open-palm rule.
 function handStill(now) {
@@ -1469,7 +1476,7 @@ function maybeNotice() {
   if (key === noticeKey) return;                 // only when something actually changes
   noticeKey = key;
   if (first) return;                             // never on the very first reading
-  if (cube.on) return;                           // don't interrupt a solve
+  if (cubeBusy()) return;                        // don't interrupt a solve
   if (!engine || busy || hearing || talking || pending) return;
   if (who === 'nobody' || (faceprint && who !== 'mukta')) return;
   if (awaySince) return;                         // only while you're looking at the iPad
@@ -1604,12 +1611,15 @@ function stopTimer() {
   $('timer').textContent = '--:--';
 }
 
-// ================= Cube timer: ✋ to get ready, drop your hand to start, ✋ again to stop =================
-// While cube mode is on, gesture rules, waves, check-ins and remarks are paused, so solving can't set anything off.
+// ================= Cube timer: both hands flat (✋✋) to get ready, lift them to start, ✋✋ again to stop =================
+// Works like a real cube timer mat, and it's always on while the camera is: no button to press.
+// Two palms at once never happens by accident, so it can't clash with the one-hand ✋ rule or with waving.
+// While it's getting ready or running, gesture rules, waves, check-ins and remarks are paused.
 // It never turns a sensor on: with the camera off, you tap the clock instead.
 const CUBE_KEY = 'desk.cube';
-const ARM_MS = 600, GO_MS = 150, STOP_MS = 400, MIN_SOLVE_MS = 5000;
-const cube = { on: false, state: 'idle', start: 0, palmSince: 0, lastPalm: 0, awaySince: 0, release: false, raf: null };
+const ARM_MS = 600, GO_MS = 150, STOP_MS = 400, MIN_SOLVE_MS = 5000, MAX_SOLVE_MS = 20 * 60000, SHOW_RESULT_MS = 15000;
+const cube = { state: 'idle', start: 0, palmSince: 0, lastPalm: 0, awaySince: 0, release: false, raf: null, hideAt: 0 };
+const cubeBusy = () => cube.state === 'armed' || cube.state === 'running';
 let cubeTimes = [];
 try { cubeTimes = JSON.parse(localStorage.getItem(CUBE_KEY) || '[]').filter(t => Number.isFinite(t.ms) && t.ms > 0); } catch { cubeTimes = []; }
 
@@ -1661,80 +1671,78 @@ function addCubeTime(ms, hand = false) {
   return pb;
 }
 
-function cubeClock(text, cls = '') { $('cubeClock').textContent = text; $('cubeClock').className = cls; }
+// The clock shows in two places: big on top of the camera (so you see it while solving) and in the Cube timer card.
+function cubeClock(text, cls = '', note = '') {
+  $('cubeClock').textContent = text; $('cubeClock').className = cls;
+  $('cubeOverlay').hidden = false;
+  $('cubeOverlay').className = cls;
+  $('cubeOverlay').innerHTML = `${text}${note ? `<small>${note}</small>` : ''}`;
+}
 function cubeSet(state, msg) { cube.state = state; if (msg != null) $('cubeState').textContent = msg; }
 function cubeTick() {
   if (cube.state !== 'running') return;
-  cubeClock(fmtCube(performance.now() - cube.start), 'running');
+  const ms = performance.now() - cube.start;
+  if (ms > MAX_SOLVE_MS) { cubeCancel('Stopped after 20 minutes without a finish, so that one wasn\'t saved.'); log('cube solve cancelled: over 20 min'); return; }
+  cubeClock(fmtCube(ms), 'running');
   cube.raf = requestAnimationFrame(cubeTick);
 }
 function cubeGo(at) {
   cube.start = at;
-  cubeSet('running', 'Solving… show ✋ (or tap the clock) when you finish.');
+  cubeSet('running', 'Solving… put the cube down and show ✋✋ (or tap the clock) when you finish.');
   cancelAnimationFrame(cube.raf); cube.raf = requestAnimationFrame(cubeTick);
 }
 function cubeStop(at) {
   cancelAnimationFrame(cube.raf);
   const ms = at - cube.start;
   const pb = addCubeTime(ms);
-  cube.release = true;   // your hand has to leave the ✋ before it can get ready again
-  cubeClock(fmtCube(ms), pb ? 'pb' : '');
-  cubeSet('idle', pb ? '🎉 New personal best!' : 'Nice. Show ✋ again when you want another go.');
+  cube.release = true;   // your hands have to leave before it can get ready again
+  cubeClock(fmtCube(ms), pb ? 'pb' : 'done', pb ? '🎉 new personal best!' : `best ${fmtCube(cubeStats(cubeTimes).best)}`);
+  cubeSet('idle', pb ? '🎉 New personal best!' : 'Nice. Show ✋✋ again when you want another go.');
+  cube.hideAt = at + SHOW_RESULT_MS;   // same clock as the camera frames
   if (pb) say('New personal best!');
 }
 function cubeCancel(msg) {
   cancelAnimationFrame(cube.raf);
   cube.release = false;
-  cubeClock('0.00');
   cubeSet('idle', msg);
+  $('cubeClock').textContent = '0.00'; $('cubeClock').className = '';
+  $('cubeOverlay').hidden = true;
 }
 
-// Called for every camera frame with the hand shape seen right now (not the held one), so starting and stopping is quick.
-function cubeFrame(name, now) {
-  if (!cube.on) return;
-  const palm = name === 'Open_Palm' || name === 'Four';   // a palm with the thumb a bit tucked reads as 4, so both count
-  if (palm) { if (!cube.palmSince) cube.palmSince = now; cube.lastPalm = now; cube.awaySince = 0; }
+// Is each hand flat? All four fingers straight counts, with or without the thumb, so a slightly tucked thumb still works.
+function flatHands(result) {
+  return (result.landmarks || []).filter(lm => {
+    const ext = (tip, pip) => d(lm[0], lm[tip]) > d(lm[0], lm[pip]) * 1.1;
+    return ext(8, 6) && ext(12, 10) && ext(16, 14) && ext(20, 18);
+  }).length;
+}
+
+// Called for every camera frame with "are both hands flat right now?", so starting and stopping is quick.
+function cubeFrame(both, now) {
+  if (cube.state === 'idle' && cube.hideAt && now > cube.hideAt) { cube.hideAt = 0; $('cubeOverlay').hidden = true; }
+  if (both) { if (!cube.palmSince) cube.palmSince = now; cube.lastPalm = now; cube.awaySince = 0; }
   else { cube.palmSince = 0; if (!cube.awaySince) cube.awaySince = now; }
-  if (cube.release) { if (!palm) cube.release = false; return; }
-  if (cube.state === 'idle' && palm && now - cube.palmSince > ARM_MS) {
-    cubeClock('0.00', 'armed');
-    cubeSet('armed', 'Ready! Drop your hand to start.');
-  } else if (cube.state === 'armed' && !palm && now - cube.awaySince > GO_MS) {
-    cubeGo(cube.lastPalm);   // the clock starts from the moment your hand left, not a moment later
-  } else if (cube.state === 'running' && palm && now - cube.palmSince > STOP_MS && cube.palmSince - cube.start > MIN_SOLVE_MS) {
-    cubeStop(cube.palmSince);   // stops from the moment your ✋ appeared
+  if (cube.release) { if (!both) cube.release = false; return; }
+  if (cube.state === 'idle' && both && now - cube.palmSince > ARM_MS) {
+    cube.hideAt = 0;
+    cubeClock('0.00', 'armed', 'ready: lift your hands to start');
+    cubeSet('armed', 'Ready! Lift your hands to start.');
+    log('cube timer ready');
+  } else if (cube.state === 'armed' && !both && now - cube.awaySince > GO_MS) {
+    cubeGo(cube.lastPalm);   // the clock starts from the moment your hands left, not a moment later
+  } else if (cube.state === 'running' && both && now - cube.palmSince > STOP_MS && cube.palmSince - cube.start > MIN_SOLVE_MS) {
+    cubeStop(cube.palmSince);   // stops from the moment your ✋✋ appeared
   }
 }
 
 function cubeTap() {
-  if (!cube.on) { setCube(true); }
   if (cube.state === 'running') { const t = performance.now(); if (t - cube.start > 1000) cubeStop(t); return; }
   cube.release = false;
-  cubeClock('0.00', 'running');
   cubeGo(performance.now());
+  cubeClock('0.00', 'running');
 }
-function setCube(on) {
-  cube.on = on;
-  $('cubeBtn').textContent = `Cube mode: ${on ? 'ON' : 'OFF'}`;
-  $('cubeBtn').classList.toggle('on', on);
-  if (on) {
-    cube.release = false;
-    cubeSet('idle', sensors.cam.stream
-      ? 'Show ✋ to get ready. Gestures, waves and chat pop-ups are paused while cube mode is on.'
-      : 'The camera is off, so tap the clock to start and stop. (Turn the camera on to use ✋.)');
-    log('cube mode on: gesture rules, waves and check-ins paused');
-  } else {
-    if (cube.state === 'running') log('cube solve cancelled (cube mode turned off)');
-    cubeCancel('Turn cube mode on. Then show ✋, drop your hand to start, and show ✋ again to stop. Or just tap the clock.');
-    log('cube mode off');
-  }
-}
-$('cubeBtn').addEventListener('click', () => setCube(!cube.on));
 $('cubeClock').addEventListener('click', cubeTap);
-document.addEventListener('keydown', e => {
-  if (e.code !== 'Space' || !cube.on || ['INPUT', 'BUTTON', 'SELECT'].includes(document.activeElement?.tagName)) return;
-  e.preventDefault(); cubeTap();
-});
+$('cubeOverlay').addEventListener('click', cubeTap);
 $('cubeAddForm').addEventListener('submit', e => {
   e.preventDefault();
   const ms = parseCube($('cubeAdd').value);
@@ -1829,7 +1837,7 @@ const COOLDOWN_MS = 3000;
 const lastFired = {};
 function onGesture(g, still = true) {
   log(`gesture: ${GESTURES[g]}`);
-  if (cube.on) return;   // cube mode: gestures only drive the cube timer
+  if (cubeBusy()) return;   // while the cube timer is ready or running, gestures only drive it
   const a = rules[g];
   if (!a || !ACTIONS[a]) return;
   if (!still) { log(`rule skipped: hand was moving`); return; }
@@ -1936,7 +1944,7 @@ async function getRecognizer() {
   const vision = await FilesetResolver.forVisionTasks('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.0.1/wasm');
   recognizer = await GestureRecognizer.createFromOptions(vision, {
     baseOptions: { modelAssetPath: './models/gesture_recognizer.task', delegate: 'CPU' },
-    runningMode: 'VIDEO', numHands: 1,
+    runningMode: 'VIDEO', numHands: 2,   // 2 so the cube timer can see both hands; everything else uses the first hand
   });
   try { await getFaceMarker(vision); } catch (err) { log(`expression reader failed to load: ${err.message}`); }
   return recognizer;
@@ -1997,8 +2005,11 @@ function gestureFrame(video, now) {
   {
     {
       const result = recognizer.recognizeForVideo(video, now);
-      const name = classify(result);
-      cubeFrame(name, now);
+      const hands = result.landmarks?.length || 0;
+      const both = hands === 2 && flatHands(result) === 2;
+      cubeFrame(both, now);
+      // With two hands up, the one-hand gestures are ignored (either hand could be read, and ✋✋ belongs to the cube timer).
+      const name = hands === 2 ? null : classify(result);
       readHand(result, now);
       if (faceMarker && ++exprFrame % 3 === 0) readExpression(faceShapes(faceMarker.detectForVideo(video, now)));
       if (name !== candidate) { candidate = name; candidateSince = now; }
